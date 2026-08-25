@@ -1,0 +1,30 @@
+# ===== 构建产物 =====
+build/
+cmake-build-*/
+
+# ===== 模型文件（体积大，不入库，单独分发）=====
+models/ncnn_model/*.bin
+models/ncnn_model/*.param.bin
+*.onnx
+*.tflite
+
+# ===== 编译中间文件 =====
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.exe
+*.out
+
+# ===== IDE / 系统 =====
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# ===== 日志与临时文件 =====
+*.log
+tmp/
