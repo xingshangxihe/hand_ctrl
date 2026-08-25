@@ -71,11 +71,16 @@ struct FsmConfig {
 
     // 握拳判定
     int   fistDistThreshold = 160;      // 握拳距离阈值（像素）：所有指尖到手腕距离均小于此值
+    float indexExtensionRatio = 1.8f;   // 食指伸直比值阈值：食指尖到手腕/食指根到手腕 > 此值
+                                        // 视为食指伸直（非握拳）。比值法对"手指朝屏幕"投影缩短鲁棒
 
     // 点击/拖拽判定（v2 核心）
     float clickPressSpeedPx = 60.f;     // 下压速度阈值（像素/秒）：食指尖 y 方向下落速度超此值判定"按下"
     int   clickPressTimeMs  = 250;      // 按下后回弹最大时长（毫秒）：在此时长内抬起 = 单击
     int   clickReleaseTimeMs = 250;     // 预留：回弹判定时长（当前与 press 共用）
+
+    // 鼠标绝对定位灵敏度
+    float mouseSensitivity = 2.0f;      // 目标位移 × 系数 = 实际注入位移（>1 更灵敏）
 
     // 图像尺寸（用于坐标映射比例计算）
     int   imageWidth  = 640;
@@ -126,6 +131,9 @@ public:
     // 获取图像尺寸（供上层做坐标映射）
     int imageWidth() const  { return m_cfg.imageWidth; }
     int imageHeight() const { return m_cfg.imageHeight; }
+
+    // 获取鼠标定位灵敏度系数（供上层将目标位移放大后注入）
+    float mouseSensitivity() const { return m_cfg.mouseSensitivity; }
 
 private:
     // --------------------------- 状态成员 ---------------------------

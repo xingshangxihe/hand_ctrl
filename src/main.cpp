@@ -281,15 +281,21 @@ int main(int argc, char* argv[]) {
 
     // v2 绝对定位：软件维护虚拟鼠标位置（相对位移设备无法直接"跳到"目标坐标）
     // 映射公式：screenPos = fingerPos / imageSize * screenSize
-    // 每次注入 (虚拟目标 - 当前虚拟位置) 的相对位移，并更新虚拟位置。
-    // 锁定瞬间虚拟位置初始化为屏幕中心（等价于手指落在画面中心时指针在屏幕中心）。
+    // 每次注入 (虚拟目标 - 当前虚拟位置) × 灵敏度 的相对位移，并更新虚拟位置。
+    // 说明：
+    //   1. 灵敏度 >1 使鼠标移动更快（指尖小幅移动 → 鼠标大幅移动）
+    //   2. 使用 float 累积位移 + 整数残差，避免连续取整丢步导致"不灵敏"
+    //   3. 锁定瞬间虚拟位置初始化为屏幕中心（等价于手指落在画面中心时指针在屏幕中心）
     const int scrW = fsm.screenWidth();
     const int scrH = fsm.screenHeight();
     const int imgW = fsm.imageWidth();
     const int imgH = fsm.imageHeight();
+    const float mouseSens = fsm.mouseSensitivity();  // 定位灵敏度系数
     float virtualMouseX = scrW / 2.f;   // 虚拟鼠标当前位置（屏幕坐标）
     float virtualMouseY = scrH / 2.f;
     bool  virtualInit = false;          // 锁定后首帧需初始化虚拟位置
+    float moveAccumX = 0.f;             // 小数位移残差累积器（保证不丢步）
+    float moveAccumY = 0.f;
     while (!g_shouldExit.load()) {
         // ---- 画面显示：放在循环最前，不依赖关键点队列（摄像头断流时也持续刷新）----
         // 说明：imshow/waitKey 必须在主线程调用（GTK 限制）；时间驱动每 40ms 刷新。
@@ -336,12 +342,14 @@ int main(int argc, char* argv[]) {
                 // 注意：OpenCV putText 只支持 ASCII（Hershey 矢量字体），中文会乱码，故用英文
                 std::string stateText = std::string("State: ") + fsm.currentStateName() + "  (fist 1.2s to lock)";
                 cv::putText(vis, stateText, cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 255), 2);
-                // 使用 WINDOW_NORMAL 允许调整窗口大小（AUTOSIZE 下 resizeWindow 无效）
-                cv::namedWindow("hand-ctrl", cv::WINDOW_NORMAL);
-                cv::imshow("hand-ctrl", vis);
-                cv::resizeWindow("hand-ctrl", 960, 720);
-                int key = cv::waitKey(10);  // 10ms 让 GTK 有时间处理窗口绘制
-                if (key == 27) g_shouldExit.store(true);  // ESC 键退出
+                // 窗口创建：只在首次调用 namedWindow（WINDOW_NORMAL 允许调整大小）。
+                // 关键修复：若每次循环都调用 namedWindow，用户点 × 关闭窗口后，
+                //           下一帧又会重建新窗口，导致关闭检测永远失效。
+                static bool winCreated = false;
+                if (!winCreated) {
+                    cv::namedWindow("hand-ctrl", cv::WINDOW_NORMAL);
+                    winCreated = true;
+                }
                 // 点击窗口右上角 × 时：窗口被销毁，WND_PROP_VISIBLE 变为 0。
                 // 注意：GTK/VMware 下窗口被遮挡/最小化/焦点变化时该值可能瞬时为 0，
                 //       若立即退出会误判。故采用"连续 N 次不可见才退出"的防抖策略。
@@ -354,6 +362,13 @@ int main(int argc, char* argv[]) {
                 } else {
                     invisibleCnt = 0;  // 窗口可见，重置计数器
                 }
+                // 窗口未被关闭时才渲染当前帧（窗口关闭后不再调用 imshow 重建）
+                if (cv::getWindowProperty("hand-ctrl", cv::WND_PROP_VISIBLE) >= 1) {
+                    cv::imshow("hand-ctrl", vis);
+                    cv::resizeWindow("hand-ctrl", 960, 720);
+                }
+                int key = cv::waitKey(10);  // 10ms 让 GTK 有时间处理窗口绘制
+                if (key == 27) g_shouldExit.store(true);  // ESC 键退出
                 // 诊断：每 5 秒打印一次帧状态（仅调试，帮助定位黑屏原因）
                 static int diagCnt = 0;
                 if (++diagCnt % 125 == 0) {
@@ -461,9 +476,16 @@ int main(int argc, char* argv[]) {
                         virtualMouseY = targetY;
                         virtualInit = true;
                     }
-                    // 相对位移 = 目标 - 虚拟位置（uinput 仅支持相对位移）
-                    int dx = static_cast<int>(targetX - virtualMouseX);
-                    int dy = static_cast<int>(targetY - virtualMouseY);
+                    // 目标位移 × 灵敏度（提高响应速度）
+                    float wantDx = (targetX - virtualMouseX) * mouseSens;
+                    float wantDy = (targetY - virtualMouseY) * mouseSens;
+                    // 累积小数残差，整数部分注入 uinput（避免连续取整丢步）
+                    moveAccumX += wantDx;
+                    moveAccumY += wantDy;
+                    int dx = static_cast<int>(moveAccumX);
+                    int dy = static_cast<int>(moveAccumY);
+                    moveAccumX -= dx;
+                    moveAccumY -= dy;
                     if (dx != 0 || dy != 0) {
                         uinput.moveMouse(dx, dy);
                         virtualMouseX += dx;

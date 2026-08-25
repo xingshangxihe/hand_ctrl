@@ -75,12 +75,14 @@ bool GestureFSM::loadConfig(const std::string& configPath) {
     jsonGetFloat(json, "process_noise",         m_cfg.kalmanProcessNoise);
     jsonGetFloat(json, "measure_noise",         m_cfg.kalmanMeasureNoise);
     jsonGetInt  (json, "distance_threshold_px", m_cfg.fistDistThreshold);
+    jsonGetFloat(json, "index_extension_ratio", m_cfg.indexExtensionRatio);
     jsonGetFloat(json, "press_speed_px",        m_cfg.clickPressSpeedPx);
     jsonGetInt  (json, "press_time_ms",         m_cfg.clickPressTimeMs);
     jsonGetInt  (json, "release_time_ms",       m_cfg.clickReleaseTimeMs);
+    jsonGetFloat(json, "sensitivity",           m_cfg.mouseSensitivity);
     jsonGetInt  (json, "width",                 m_cfg.imageWidth);
     jsonGetInt  (json, "height",                m_cfg.imageHeight);
-    // 屏幕分辨率在嵌套字段 screen.width / screen.height（轻量解析按 key 全局查找）
+    // 屏幕分辨率在嵌套字段 screen.screen_width / screen.screen_height（轻量解析按 key 全局查找）
     jsonGetInt  (json, "screen_width",          m_cfg.screenWidth);
     jsonGetInt  (json, "screen_height",         m_cfg.screenHeight);
 
@@ -160,6 +162,20 @@ bool GestureFSM::detectFistHold(const HandKeypoints& kp) {
     const float minHandSpan = 30.f;
     const float maxHandSpan = 400.f;
     if (maxTipDist < minHandSpan || maxTipDist > maxHandSpan) return false;
+
+    // 食指伸直比值检查（防"伸食指控制"被误判为握拳）：
+    //   单指控制时手指朝屏幕方向，透视投影使"指尖到手腕距离"变短，
+    //   5 个指尖距离都可能 < 阈值 → 误判握拳 → 状态异常切换。
+    //   解法：用"食指指尖(8)到手腕(0)"与"食指根(5)到手腕(0)"的比值。
+    //   手指朝屏幕时投影等比缩短，比值保持稳定：
+    //     - 握拳：指尖蜷回掌心，比值 ≈ 1.0~1.5
+    //     - 食指伸直：比值显著 > 1.8
+    float indexTipToWrist = distance(kp.points[8].x, kp.points[8].y, w.x, w.y);
+    float indexBaseToWrist = distance(kp.points[5].x, kp.points[5].y, w.x, w.y);
+    if (indexBaseToWrist > 1e-6f) {
+        float ratio = indexTipToWrist / indexBaseToWrist;
+        if (ratio > m_cfg.indexExtensionRatio) return false;  // 食指伸直 → 非握拳
+    }
     return true;
 }
 
