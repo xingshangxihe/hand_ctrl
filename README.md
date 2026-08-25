@@ -141,8 +141,10 @@ make -j$(nproc) hand_ctrl
 
 ```bash
 cd ~/hand_ctrl
-sudo ./build/hand_ctrl config/gesture_config.json models 0        # 无 GUI（推荐）
+sudo ./build/hand_ctrl config/gesture_config.json models 0        # 无 GUI，完整日志
+sudo ./build/hand_ctrl config/gesture_config.json models 0 -q     # 无 GUI，静默（正式使用）
 sudo ./build/hand_ctrl config/gesture_config.json models 0 -v     # 带实时画面
+sudo ./build/hand_ctrl config/gesture_config.json models 0 -v -q  # 画面 + 静默
 ```
 
 ### 配置热加载（实时生效）
@@ -250,16 +252,20 @@ sudo usermod -aG input $USER    # 加入 input 用户组
 | uinput | 保持（Linux 标准接口） |
 | 编译 | 交叉编译链（aarch64-linux-gnu） |
 
-## 已实现的功能细节（阶段7 收尾）
+## 已实现的功能细节（阶段7 收尾 + 迭代增强）
 
 - [x] **双模型精确手掌裁剪**：palm_detection 定位手掌框 → 裁剪 → hand_landmark 关键点
 - [x] **脸部/耳朵误检过滤**：双层防线（palm 阈值 0.7 + landmark 置信度 0.5）
 - [x] **手势→按键映射 JSON 自定义**：`config/gesture_config.json` 的 `key_map` 字段
 - [x] **配置热加载**：修改 JSON 约 1 秒内实时生效（无需重启程序）
+- [x] **鼠标跟随体验优化**：掌心帧间相对位移 × 灵敏度系数（`mouse.sensitivity`），
+      手停鼠标即停，不会因手偏出画面中心而漂移
+- [x] **握拳拖拽分离**：握拳 >0.5s 进入拖拽（按住左键 + 移动跟手），松开释放；
+      拖拽中手静止握拳 ≥1.2s 才解锁（`drag.unlock_static_px` 控制静止阈值），
+      避免拖拽移动被误判为解锁
+- [x] **静默运行模式**：`-q` 参数关闭推理/采集心跳日志，正式使用画面干净，
+      仅保留事件触发与错误日志
 
 ## 后续迭代规划
 
-- [ ] 握拳拖拽分离（长按+移动，当前握拳短按/长按共用一个事件）
-- [ ] 鼠标跟随体验优化（当前用掌根相对中心位移，可调灵敏度系数）
-- [ ] 配置增加 `verbose` 开关，控制调试日志输出级别
-- [ ] RV1106 嵌入式板卡移植
+- [ ] RV1106 嵌入式板卡移植（填充 `rknn_infer.cpp`，交叉编译）

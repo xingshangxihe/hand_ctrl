@@ -80,6 +80,10 @@ bool GestureFSM::loadConfig(const std::string& configPath) {
     jsonGetFloat(json, "horizontal_ratio",            m_cfg.swipeHorizontalRatio);
     jsonGetFloat(json, "thumb_extended_ratio",        m_cfg.thumbExtendedRatio);
     jsonGetInt  (json, "other_fingers_fold_threshold", m_cfg.otherFingersFoldPx);
+    // 注意：以下 key 名与 gesture_config.json 中的嵌套结构字段名一致
+    //   drag.unlock_static_px、mouse.sensitivity（轻量解析器按字段名全局查找）
+    jsonGetInt  (json, "unlock_static_px",            m_cfg.dragUnlockStaticPx);
+    jsonGetFloat(json, "sensitivity",                 m_cfg.mouseSensitivity);
     jsonGetInt  (json, "width",                       m_cfg.imageWidth);
     jsonGetInt  (json, "height",                      m_cfg.imageHeight);
 
@@ -271,13 +275,23 @@ GestureEvent GestureFSM::handleFrame(const HandKeypoints& kpRaw, double dtMs) {
     //    阈值 0.5：真手 >0.8，脸部 <0.3（实测差异明显）。低于阈值视为"无手"。
     bool lowConfidence = (kpRaw.confidence < 0.5f);
     if (!kp.valid || kp.points.size() < kHandKeypointCount || lowConfidence) {
-        // 手丢失/低置信度：重置握拳计时、滑动参考点，状态回 IDLE
+        // 手丢失/低置信度：重置握拳计时、滑动参考点
         m_fistHoldMs = 0;
         m_lastWristX = -1.f;
+        // 若正在拖拽：先发拖拽结束事件，通知上层释放左键（防止鼠标卡在按下状态）
+        GestureEvent lostEvent = GestureEvent::kNone;
+        if (m_dragging) {
+            m_dragging = false;
+            m_dragMoveAccum = 0.f;
+            m_lastDragPalmX = -1.f;
+            m_lastDragPalmY = -1.f;
+            lostEvent = GestureEvent::kFistDragEnd;
+            std::printf("[FSM] 手丢失，拖拽强制结束\n");
+        }
         if (m_state == CtrlState::kLockWait) {
             m_state = CtrlState::kIdle;
         }
-        return GestureEvent::kNone;
+        return lostEvent;
     }
 
     // 3. 当前帧各手势判定结果
@@ -326,32 +340,77 @@ GestureEvent GestureFSM::handleFrame(const HandKeypoints& kpRaw, double dtMs) {
         case CtrlState::kLocked:
             // LOCKED 态：响应所有手势
             if (isFist) {
-                // 握拳持续：判断是解锁还是短按
+                // ---- 握拳持续：拖拽 / 解锁 / 短按判定 ----
                 m_fistHoldMs += static_cast<int>(dtMs);
-                if (m_fistHoldMs % 300 < static_cast<int>(dtMs)) {
-                    std::printf("[FSM] LOCKED 握拳累计 %dms / %dms\n", m_fistHoldMs, m_cfg.lockHoldMs);
+
+                if (!m_dragging && m_fistHoldMs >= m_cfg.fistShortMs) {
+                    // 握拳超过短按阈值（0.5s）且未在拖拽 → 进入拖拽模式
+                    m_dragging = true;
+                    m_dragMoveAccum = 0.f;
+                    m_lastDragPalmX = (kp.points.size() > 9) ? kp.points[9].x : -1.f;
+                    m_lastDragPalmY = (kp.points.size() > 9) ? kp.points[9].y : -1.f;
+                    event = GestureEvent::kFistDragStart;  // 通知上层：按住左键
+                    std::printf("[FSM] 拖拽开始\n");
+                    break;  // 本帧已产生事件，跳出 switch
                 }
+
+                if (m_dragging) {
+                    // 累计拖拽期间掌心（点9）位移，用于"静止解锁"判定
+                    if (kp.points.size() > 9 && m_lastDragPalmX >= 0) {
+                        float dx = kp.points[9].x - m_lastDragPalmX;
+                        float dy = kp.points[9].y - m_lastDragPalmY;
+                        m_dragMoveAccum += std::sqrt(dx * dx + dy * dy);
+                    }
+                    if (kp.points.size() > 9) {
+                        m_lastDragPalmX = kp.points[9].x;
+                        m_lastDragPalmY = kp.points[9].y;
+                    }
+                    // 拖拽中：若手基本静止且握拳总时长 ≥ lockHoldMs → 解锁
+                    // （避免拖拽移动被误判为解锁：移动累计超阈值则不解锁）
+                    if (m_fistHoldMs >= m_cfg.lockHoldMs &&
+                        m_dragMoveAccum < m_cfg.dragUnlockStaticPx &&
+                        m_cooldownMs <= 0) {
+                        m_state = CtrlState::kIdle;
+                        m_dragging = false;
+                        m_fistHoldMs = 0;
+                        m_cooldownMs = m_cfg.stateCooldownMs;
+                        event = GestureEvent::kFistHold;  // 通知上层：已解锁
+                        std::printf("[FSM] 状态迁移：LOCKED → IDLE（拖拽静止解锁）\n");
+                    } else {
+                        event = GestureEvent::kFistDragMove;  // 拖拽中：每帧跟随移动
+                    }
+                    break;  // 本帧已产生事件，跳出 switch
+                }
+
+                // 握拳 <0.5s（未达拖拽阈值）：仅累计时长，事件在松开时触发
+                // 同时保留旧逻辑兜底：握拳 ≥lockHoldMs 且未拖拽时也解锁
                 if (m_fistHoldMs >= m_cfg.lockHoldMs && m_cooldownMs <= 0) {
-                    // 长按 ≥1.2s：解锁
                     m_state = CtrlState::kIdle;
                     m_fistHoldMs = 0;
-                    m_cooldownMs = m_cfg.stateCooldownMs;  // 进入冷却，防止快速切换
-                    event = GestureEvent::kFistHold;  // 通知上层：已解锁
+                    m_cooldownMs = m_cfg.stateCooldownMs;
+                    event = GestureEvent::kFistHold;
                     std::printf("[FSM] 状态迁移：LOCKED → IDLE（已解锁）\n");
                 }
-                // 短按（0~0.5s）的事件在松开时触发，本帧不发事件
             } else {
-                // 握拳释放：若之前累计时长 < fistShortMs，触发短按单击
-                if (m_fistHoldMs > 0 && m_fistHoldMs < m_cfg.fistShortMs) {
-                    event = GestureEvent::kFistShort;  // 左键单击
-                } else if (m_fistHoldMs >= m_cfg.fistShortMs && m_fistHoldMs < m_cfg.lockHoldMs) {
-                    event = GestureEvent::kFistShort;  // 左键拖拽释放（与单击同事件，上层按住时长区分）
+                // ---- 握拳释放 ----
+                if (m_dragging) {
+                    // 拖拽中松开：结束拖拽，释放左键
+                    m_dragging = false;
+                    m_fistHoldMs = 0;
+                    m_dragMoveAccum = 0.f;
+                    m_lastDragPalmX = -1.f;
+                    m_lastDragPalmY = -1.f;
+                    event = GestureEvent::kFistDragEnd;
+                    std::printf("[FSM] 拖拽结束\n");
+                } else if (m_fistHoldMs > 0 && m_fistHoldMs < m_cfg.fistShortMs) {
+                    // 短按（0~0.5s）松开：左键单击
+                    event = GestureEvent::kFistShort;
                 }
                 // 衰减容忍：短暂松开只衰减 30ms 不清零（与 IDLE 态一致）
                 m_fistHoldMs = (m_fistHoldMs > 30) ? (m_fistHoldMs - 30) : 0;
             }
-            // 其他手势判定（仅在未握拳时生效）
-            if (!isFist) {
+            // 其他手势判定（仅在未握拳、未拖拽时生效）
+            if (!isFist && !m_dragging) {
                 if (isOpenPalm) {
                     event = GestureEvent::kOpenPalm;
                 } else if (isOk) {

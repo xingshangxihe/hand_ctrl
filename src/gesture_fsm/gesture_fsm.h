@@ -46,13 +46,16 @@ enum class CtrlState {
 
 // 手势事件枚举：状态机对外输出的识别结果（与需求文档手势规则总表一一对应）
 enum class GestureEvent {
-    kNone       = 0,   // 未识别到任何手势
-    kFistHold   = 1,   // 握拳长按：锁定/解锁开关（≥1.2s）
-    kOpenPalm   = 2,   // 五指张开：跟随鼠标移动
-    kFistShort  = 3,   // 握拳短按：左键单击/拖拽
-    kOkGesture  = 4,   // OK手势：右键单击
-    kIndexSwipe = 5,   // 食指横向滑动：左右翻页
-    kThumbUp    = 6,   // 竖拇指：回车确认
+    kNone          = 0,   // 未识别到任何手势
+    kFistHold      = 1,   // 握拳长按：锁定/解锁开关（≥1.2s）
+    kOpenPalm      = 2,   // 五指张开：跟随鼠标移动
+    kFistShort     = 3,   // 握拳短按（0~0.5s 松开）：左键单击
+    kOkGesture     = 4,   // OK手势：右键单击
+    kIndexSwipe    = 5,   // 食指横向滑动：左右翻页
+    kThumbUp       = 6,   // 竖拇指：回车确认
+    kFistDragStart = 7,   // 握拳拖拽开始（按住 >0.5s）：按住左键
+    kFistDragMove  = 8,   // 握拳拖拽中：每帧跟随移动鼠标
+    kFistDragEnd   = 9,   // 握拳拖拽结束（松开）：释放左键
 };
 
 // JSON 配置参数集合（运行时加载，所有阈值外置）
@@ -79,6 +82,13 @@ struct FsmConfig {
     // 图像尺寸（用于比例计算）
     int   imageWidth  = 640;
     int   imageHeight = 480;
+
+    // 拖拽模式解锁判定：拖拽中若累计移动距离 < 此阈值（手静止握拳），
+    // 且握拳总时长 ≥ lockHoldMs，才触发解锁（避免拖拽移动被误判为解锁）
+    int   dragUnlockStaticPx = 80;
+
+    // 鼠标跟随灵敏度：掌心帧间位移（像素）× 此系数 = 鼠标相对位移
+    float mouseSensitivity = 0.8f;
 };
 
 class GestureFSM {
@@ -116,6 +126,13 @@ public:
     // 获取锁定倒计时剩余毫秒（LOCK_WAIT 状态下有意义）
     int lockCountdownMs() const { return m_lockCountdownMs; }
 
+    // 获取鼠标跟随灵敏度系数（供上层将掌心位移映射为鼠标位移）
+    float mouseSensitivity() const { return m_cfg.mouseSensitivity; }
+
+    // 获取图像尺寸（供上层做比例计算）
+    int imageWidth() const  { return m_cfg.imageWidth; }
+    int imageHeight() const { return m_cfg.imageHeight; }
+
 private:
     // --------------------------- 状态成员 ---------------------------
     CtrlState m_state = CtrlState::kIdle;   // 当前状态
@@ -130,6 +147,14 @@ private:
 
     // 状态切换防抖冷却计时器（毫秒）：状态迁移后置为 cooldown 值，每帧递减
     int m_cooldownMs = 0;
+
+    // 握拳拖拽状态：false=未拖拽，true=正在拖拽（左键按住中）
+    bool m_dragging = false;
+    // 拖拽期间累计移动距离（像素）：用于"手静止握拳长按"解锁判定
+    float m_dragMoveAccum = 0.f;
+    // 拖拽期间上一帧掌心（点9）坐标：用于累计位移
+    float m_lastDragPalmX = -1.f;
+    float m_lastDragPalmY = -1.f;
 
     // 卡尔曼滤波器数组：每个关键点一个
     KalmanFilter m_filters[kHandKeypointCount];

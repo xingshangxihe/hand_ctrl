@@ -32,13 +32,16 @@ static void onSignal(int) { g_shouldExit = 1; }
 // 手势事件名（用于日志打印）
 static const char* eventToString(GestureEvent e) {
     switch (e) {
-        case GestureEvent::kNone:       return "无";
-        case GestureEvent::kFistHold:   return "握拳长按(锁定/解锁)";
-        case GestureEvent::kOpenPalm:   return "五指张开(鼠标跟随)";
-        case GestureEvent::kFistShort:  return "握拳短按(左键)";
-        case GestureEvent::kOkGesture:  return "OK(右键)";
-        case GestureEvent::kIndexSwipe: return "食指滑动(翻页)";
-        case GestureEvent::kThumbUp:    return "竖拇指(回车)";
+        case GestureEvent::kNone:          return "无";
+        case GestureEvent::kFistHold:      return "握拳长按(锁定/解锁)";
+        case GestureEvent::kOpenPalm:      return "五指张开(鼠标跟随)";
+        case GestureEvent::kFistShort:     return "握拳短按(左键单击)";
+        case GestureEvent::kFistDragStart: return "握拳拖拽开始";
+        case GestureEvent::kFistDragMove:  return "握拳拖拽移动";
+        case GestureEvent::kFistDragEnd:   return "握拳拖拽结束";
+        case GestureEvent::kOkGesture:     return "OK(右键)";
+        case GestureEvent::kIndexSwipe:    return "食指滑动(翻页)";
+        case GestureEvent::kThumbUp:       return "竖拇指(回车)";
     }
     return "未知";
 }
