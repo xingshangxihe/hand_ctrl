@@ -1,13 +1,13 @@
 // ============================================================================
 // gesture_fsm/fsm_test.cpp
-// 作用：手势 FSM 模块【独立验收测试程序】。
+// 作用：手势 FSM 模块【独立验收测试程序】（v2 单指方案）。
 // 行为：
 //   - 加载 gesture_config.json
 //   - 从摄像头读取帧 → ONNX 推理 → 卡尔曼平滑 → FSM 推进 → 打印状态/事件
 // 用法：
 //   ./fsm_test [配置文件] [模型目录] [设备索引]
 //   ./fsm_test config/gesture_config.json models 0
-// 说明：验证 1.2s 握拳锁定倒计时、6 种手势判定，无 uinput 输出（仅打印）。
+// 说明：验证 1.2s 握拳锁定倒计时、单指定位/点击/拖拽事件，无 uinput 输出（仅打印）。
 // ============================================================================
 
 #include <cstdio>
@@ -29,19 +29,16 @@ using namespace hand_ctrl;
 static volatile sig_atomic_t g_shouldExit = 0;
 static void onSignal(int) { g_shouldExit = 1; }
 
-// 手势事件名（用于日志打印）
+// 手势事件名（用于日志打印，v2 单指方案）
 static const char* eventToString(GestureEvent e) {
     switch (e) {
-        case GestureEvent::kNone:          return "无";
-        case GestureEvent::kFistHold:      return "握拳长按(锁定/解锁)";
-        case GestureEvent::kOpenPalm:      return "五指张开(鼠标跟随)";
-        case GestureEvent::kFistShort:     return "握拳短按(左键单击)";
-        case GestureEvent::kFistDragStart: return "握拳拖拽开始";
-        case GestureEvent::kFistDragMove:  return "握拳拖拽移动";
-        case GestureEvent::kFistDragEnd:   return "握拳拖拽结束";
-        case GestureEvent::kOkGesture:     return "OK(右键)";
-        case GestureEvent::kIndexSwipe:    return "食指滑动(翻页)";
-        case GestureEvent::kThumbUp:       return "竖拇指(回车)";
+        case GestureEvent::kNone:        return "无";
+        case GestureEvent::kFistHold:    return "握拳长按(锁定/解锁)";
+        case GestureEvent::kPointerMove: return "食指定位移动";
+        case GestureEvent::kClick:       return "食指点击(左键)";
+        case GestureEvent::kDragStart:   return "拖拽开始";
+        case GestureEvent::kDragMove:    return "拖拽移动";
+        case GestureEvent::kDragEnd:     return "拖拽结束";
     }
     return "未知";
 }
@@ -91,7 +88,7 @@ int main(int argc, char* argv[]) {
     auto lastTime = std::chrono::steady_clock::now();
     auto startTime = lastTime;
     int frameCnt = 0;
-    int eventCnt[8] = {0};
+    int eventCnt[7] = {0};  // v2 共 7 个事件（kNone=0 ~ kDragEnd=6）
 
     while (true) {
         // 信号检测：Ctrl+C 优雅退出
@@ -179,7 +176,7 @@ int main(int argc, char* argv[]) {
     camera.release();
     cv::destroyAllWindows();
     std::printf("[fsm_test] 结束。共 %d 帧，事件统计:\n", frameCnt);
-    for (int i = 1; i <= 6; ++i) {
+    for (int i = 1; i <= 6; ++i) {  // kFistHold(1) ~ kDragEnd(6)
         std::printf("  %-20s: %d 次\n", eventToString(static_cast<GestureEvent>(i)), eventCnt[i]);
     }
     return 0;

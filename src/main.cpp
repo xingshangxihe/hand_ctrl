@@ -1,20 +1,26 @@
 // ============================================================================
 // src/main.cpp
-// 作用：程序入口 + 多线程调度器（阶段6 联调版）。
+// 作用：程序入口 + 多线程调度器（v2 单指控制方案）。
 //
 // 线程架构（三线程解耦，避免阻塞卡顿）：
 //   采集线程:   Camera::readFrame → 帧队列
 //   推理线程:   从帧队列取帧 → ONNXInfer::infer → 关键点队列
 //   主线程  :   从关键点队列取 → GestureFSM::handleFrame → UInputManager 输出
 //
+// v2 交互模型（方案A：单指绝对定位）：
+//   锁定后食指指尖 = 鼠标指针（画面坐标等比映射屏幕坐标）
+//   快速下点 = 单击；下点按住 = 拖拽；握拳1.2s = 锁定/解锁
+//
+// 绝对定位实现要点：
+//   uinput 是相对位移设备，需软件维护"虚拟鼠标位置"：
+//   每次计算 目标位置 - 虚拟位置 = 相对位移，注入后更新虚拟位置。
+//   （若虚拟位置与真实指针脱节，可用物理鼠标微调，或重新锁定/解锁一次校准）
+//
 // 线程间通信：std::mutex + std::condition_variable + 共享队列（生产-消费者模型）
 // 信号处理：Ctrl+C 优雅退出，析构释放所有资源（RAII）
 //
 // 用法：
-//   sudo ./hand_ctrl [配置文件] [模型目录] [设备索引]
-//   sudo ./hand_ctrl config/gesture_config.json models 0
-//
-// 性能指标（阶段6 验收目标）：端到端延迟 ≤50ms，长时间运行无崩溃
+//   sudo ./hand_ctrl [配置文件] [模型目录] [设备索引] [-v] [-q]
 // ============================================================================
 
 #include <cstdio>
@@ -28,9 +34,6 @@
 #include <chrono>
 #include <atomic>
 #include <cstdint>
-#include <fstream>
-#include <sstream>
-#include <linux/input.h>           // KEY_* 宏
 #include <opencv2/opencv.hpp>
 
 #include "utils/common.h"
@@ -44,20 +47,6 @@ using namespace hand_ctrl;
 
 // 前向声明：事件转字符串（供 main 函数日志打印）
 static const char* eventToString(GestureEvent e);
-
-// --------------------------- 手势→按键映射（来自 config key_map） ---------------------------
-// 结构：保存手势对应输出的 Linux 键码（KEY_* 宏），从 gesture_config.json 的 key_map 读取，
-//       实现"手势绑定按键可视化自定义"（阶段7 验收项），替换原先的硬编码。
-struct KeyMapConfig {
-    uint16_t swipeLeft  = KEY_LEFT;    // 食指左滑 → 默认 KEY_LEFT
-    uint16_t swipeRight = KEY_RIGHT;   // 食指右滑 → 默认 KEY_RIGHT
-    uint16_t confirm    = KEY_ENTER;   // 竖拇指   → 默认 KEY_ENTER
-};
-
-// 前向声明：键码名称 → Linux 键码 / JSON 字符串提取 / 加载按键映射（实现位于文件末尾）
-static uint16_t keyNameToCode(const std::string& name, uint16_t fallback);
-static bool jsonGetString(const std::string& json, const std::string& key, std::string& out);
-static bool loadKeyMap(const std::string& configPath, KeyMapConfig& out);
 
 // --------------------------- 全局退出标志 ---------------------------
 static std::atomic<bool> g_shouldExit{false};
@@ -144,13 +133,11 @@ int main(int argc, char* argv[]) {
     std::signal(SIGINT, onSignal);
     std::signal(SIGTERM, onSignal);
 
-    // 2. 加载手势 FSM 配置 + 手势→按键映射
+    // 2. 加载手势 FSM 配置（v2 单指方案）
     GestureFSM fsm;
     if (!fsm.loadConfig(configPath)) {
         std::fprintf(stderr, "[main] FSM 配置加载失败，使用默认参数\n");
     }
-    KeyMapConfig keyMap;  // 手势→按键映射（默认 KEY_LEFT/KEY_RIGHT/KEY_ENTER）
-    loadKeyMap(configPath, keyMap);
 
     // 3. 加载推理模型
     ONNXInfer infer;
@@ -292,11 +279,17 @@ int main(int argc, char* argv[]) {
     int fsmCnt = 0;
     int waitLogCnt = 0;
 
-    // 帧间相对位移参考点：鼠标跟随（开掌）与拖拽各用一组
-    // 说明：用"上一帧掌心坐标"计算相对位移，比"相对画面中心绝对坐标"更跟手，
-    //       手停在哪鼠标就停在哪（不会因手偏出中心而持续漂移）。
-    float lastPalmX = -1.f, lastPalmY = -1.f;   // 开掌鼠标跟随参考点
-    float dragPalmX = -1.f, dragPalmY = -1.f;   // 拖拽移动参考点
+    // v2 绝对定位：软件维护虚拟鼠标位置（相对位移设备无法直接"跳到"目标坐标）
+    // 映射公式：screenPos = fingerPos / imageSize * screenSize
+    // 每次注入 (虚拟目标 - 当前虚拟位置) 的相对位移，并更新虚拟位置。
+    // 锁定瞬间虚拟位置初始化为屏幕中心（等价于手指落在画面中心时指针在屏幕中心）。
+    const int scrW = fsm.screenWidth();
+    const int scrH = fsm.screenHeight();
+    const int imgW = fsm.imageWidth();
+    const int imgH = fsm.imageHeight();
+    float virtualMouseX = scrW / 2.f;   // 虚拟鼠标当前位置（屏幕坐标）
+    float virtualMouseY = scrH / 2.f;
+    bool  virtualInit = false;          // 锁定后首帧需初始化虚拟位置
     while (!g_shouldExit.load()) {
         // ---- 画面显示：放在循环最前，不依赖关键点队列（摄像头断流时也持续刷新）----
         // 说明：imshow/waitKey 必须在主线程调用（GTK 限制）；时间驱动每 40ms 刷新。
@@ -349,11 +342,17 @@ int main(int argc, char* argv[]) {
                 cv::resizeWindow("hand-ctrl", 960, 720);
                 int key = cv::waitKey(10);  // 10ms 让 GTK 有时间处理窗口绘制
                 if (key == 27) g_shouldExit.store(true);  // ESC 键退出
-                // 点击窗口右上角 × 时：窗口被销毁，WND_PROP_VISIBLE 返回 0
-                // 说明：waitKey 对 × 关闭只返回 -1，无法区分，必须用窗口属性检测
+                // 点击窗口右上角 × 时：窗口被销毁，WND_PROP_VISIBLE 变为 0。
+                // 注意：GTK/VMware 下窗口被遮挡/最小化/焦点变化时该值可能瞬时为 0，
+                //       若立即退出会误判。故采用"连续 N 次不可见才退出"的防抖策略。
+                static int invisibleCnt = 0;
                 if (cv::getWindowProperty("hand-ctrl", cv::WND_PROP_VISIBLE) < 1) {
-                    std::printf("[main] 画面窗口已关闭，程序退出\n");
-                    g_shouldExit.store(true);
+                    if (++invisibleCnt >= 5) {  // 约 0.5s 持续不可见才视为已关闭
+                        std::printf("[main] 画面窗口已关闭，程序退出\n");
+                        g_shouldExit.store(true);
+                    }
+                } else {
+                    invisibleCnt = 0;  // 窗口可见，重置计数器
                 }
                 // 诊断：每 5 秒打印一次帧状态（仅调试，帮助定位黑屏原因）
                 static int diagCnt = 0;
@@ -382,10 +381,11 @@ int main(int argc, char* argv[]) {
         // FSM 推进
         GestureEvent e = fsm.handleFrame(kp, dtMs);
         ++fsmCnt;
-        // 配置热加载：每 60 帧（约 1 秒）检测配置文件变更，实时生效阈值与按键映射
+        // 配置热加载：每 60 帧（约 1 秒）检测配置文件变更，实时生效阈值
         if (fsmCnt % 60 == 0) {
             if (fsm.reloadIfChanged()) {
-                loadKeyMap(configPath, keyMap);  // 同步重载手势→按键映射
+                std::printf("[main] 配置已热加载，屏幕=%dx%d\n",
+                            fsm.screenWidth(), fsm.screenHeight());
             }
             if (!g_quiet.load()) {
                 const auto& w = kp.points.empty() ? HandPoint{} : kp.points[0];
@@ -434,78 +434,56 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        // 事件映射到 uinput 输出
+        // 事件映射到 uinput 输出（v2 单指方案）
         switch (e) {
             case GestureEvent::kFistHold:
                 // 锁定/解锁切换：无 uinput 输出（仅状态切换）
                 std::printf("[main] 状态切换: %s\n", fsm.currentStateName());
-                // 安全释放左键：若此前处于拖拽中（解锁路径），左键仍按下，
-                // 必须释放避免鼠标卡在按下状态（release 事件重复发送无害）
+                // 安全释放左键：若此前在拖拽/按下中，必须释放避免鼠标卡住
                 uinput.releaseLeft();
-                // 状态切换后重置位移参考点，避免残留旧坐标导致鼠标跳变
-                lastPalmX = lastPalmY = dragPalmX = dragPalmY = -1.f;
+                // 锁定瞬间初始化虚拟鼠标位置（锁定后手指落在画面何处，指针从屏幕中心起算）
+                virtualInit = false;
                 break;
-            case GestureEvent::kOpenPalm:
-                // 鼠标跟随（开掌）：掌心（点9）帧间相对位移 × 灵敏度系数
-                if (kp.valid && kp.points.size() > 9) {
-                    if (lastPalmX >= 0 && lastPalmY >= 0) {
-                        float sens = fsm.mouseSensitivity();
-                        int dx = static_cast<int>((kp.points[9].x - lastPalmX) * sens);
-                        int dy = static_cast<int>((kp.points[9].y - lastPalmY) * sens);
+
+            case GestureEvent::kPointerMove:
+            case GestureEvent::kDragMove:
+                // 绝对定位移动（锁定定位 / 拖拽中跟手）：食指指尖坐标 → 屏幕坐标
+                {
+                    float tipX, tipY;
+                    fsm.lastIndexTip(tipX, tipY);
+                    if (tipX < 0 || tipY < 0) break;  // 尚未初始化
+                    // 画面坐标 → 屏幕坐标等比映射
+                    float targetX = tipX / imgW * scrW;
+                    float targetY = tipY / imgH * scrH;
+                    // 首帧校准：以当前虚拟位置为基准，避免首帧跳变
+                    if (!virtualInit) {
+                        virtualMouseX = targetX;
+                        virtualMouseY = targetY;
+                        virtualInit = true;
+                    }
+                    // 相对位移 = 目标 - 虚拟位置（uinput 仅支持相对位移）
+                    int dx = static_cast<int>(targetX - virtualMouseX);
+                    int dy = static_cast<int>(targetY - virtualMouseY);
+                    if (dx != 0 || dy != 0) {
                         uinput.moveMouse(dx, dy);
-                    }
-                    // 更新参考点（手停在原地 → 位移为 0 → 鼠标不动）
-                    lastPalmX = kp.points[9].x;
-                    lastPalmY = kp.points[9].y;
-                }
-                break;
-            case GestureEvent::kFistShort:
-                // 握拳短按（0~0.5s 松开）：左键单击
-                uinput.clickLeft();
-                break;
-            case GestureEvent::kFistDragStart:
-                // 拖拽开始：按住左键
-                uinput.pressLeft();
-                if (kp.valid && kp.points.size() > 9) {
-                    dragPalmX = kp.points[9].x;
-                    dragPalmY = kp.points[9].y;
-                }
-                break;
-            case GestureEvent::kFistDragMove:
-                // 拖拽移动：掌心帧间位移驱动鼠标
-                if (kp.valid && kp.points.size() > 9) {
-                    if (dragPalmX >= 0 && dragPalmY >= 0) {
-                        float sens = fsm.mouseSensitivity();
-                        int dx = static_cast<int>((kp.points[9].x - dragPalmX) * sens);
-                        int dy = static_cast<int>((kp.points[9].y - dragPalmY) * sens);
-                        uinput.moveMouse(dx, dy);
-                    }
-                    dragPalmX = kp.points[9].x;
-                    dragPalmY = kp.points[9].y;
-                }
-                break;
-            case GestureEvent::kFistDragEnd:
-                // 拖拽结束：释放左键
-                uinput.releaseLeft();
-                dragPalmX = dragPalmY = -1.f;
-                break;
-            case GestureEvent::kOkGesture:
-                uinput.clickRight();
-                break;
-            case GestureEvent::kIndexSwipe:
-                // 滑动方向：由关键点横向位移正负判断
-                if (kp.valid && kp.points.size() > 8) {
-                    // 简化：以食指尖相对中心的位置判断方向
-                    if (kp.points[8].x < kFrameWidth / 2) {
-                        uinput.sendKey(keyMap.swipeLeft);
-                    } else {
-                        uinput.sendKey(keyMap.swipeRight);
+                        virtualMouseX += dx;
+                        virtualMouseY += dy;
                     }
                 }
                 break;
-            case GestureEvent::kThumbUp:
-                uinput.sendKey(keyMap.confirm);
+
+            case GestureEvent::kClick:
+                uinput.clickLeft();  // 左键单击
                 break;
+
+            case GestureEvent::kDragStart:
+                uinput.pressLeft();  // 拖拽开始：按住左键
+                break;
+
+            case GestureEvent::kDragEnd:
+                uinput.releaseLeft();  // 拖拽结束：释放左键
+                break;
+
             case GestureEvent::kNone:
             default:
                 break;
@@ -513,8 +491,13 @@ int main(int argc, char* argv[]) {
 
         if (e != GestureEvent::kNone) {
             ++eventCnt;
-            std::printf("[main] 事件触发: %s (状态=%s)\n",
-                        eventToString(e), fsm.currentStateName());
+            // 持续类事件（定位移动/拖拽移动）每帧触发，逐帧打印会刷屏拖垮主循环
+            const bool isContinuous =
+                (e == GestureEvent::kPointerMove || e == GestureEvent::kDragMove);
+            if (!isContinuous) {
+                std::printf("[main] 事件触发: %s (状态=%s)\n",
+                            eventToString(e), fsm.currentStateName());
+            }
         }
     }
 
@@ -532,121 +515,16 @@ int main(int argc, char* argv[]) {
     return 0;
 }
 
-// --------------------------- 手势→按键映射实现 ---------------------------
-// 键码名称 → Linux 键码（支持 gesture_config.json 中可配置的常用按键）
-// @param name 配置文件中的键名（如 "KEY_LEFT"）
-// @param fallback 未匹配时的默认键码
-// @return 对应键码
-static uint16_t keyNameToCode(const std::string& name, uint16_t fallback) {
-    if (name == "KEY_LEFT")      return KEY_LEFT;
-    if (name == "KEY_RIGHT")     return KEY_RIGHT;
-    if (name == "KEY_UP")        return KEY_UP;
-    if (name == "KEY_DOWN")      return KEY_DOWN;
-    if (name == "KEY_ENTER")     return KEY_ENTER;
-    if (name == "KEY_SPACE")     return KEY_SPACE;
-    if (name == "KEY_TAB")       return KEY_TAB;
-    if (name == "KEY_ESC")       return KEY_ESC;
-    if (name == "KEY_LEFTCTRL")  return KEY_LEFTCTRL;
-    if (name == "KEY_LEFTSHIFT") return KEY_LEFTSHIFT;
-    if (name == "KEY_LEFTALT")   return KEY_LEFTALT;
-    if (name == "KEY_A")         return KEY_A;
-    if (name == "KEY_B")         return KEY_B;
-    if (name == "KEY_C")         return KEY_C;
-    if (name == "KEY_D")         return KEY_D;
-    if (name == "KEY_E")         return KEY_E;
-    if (name == "KEY_F")         return KEY_F;
-    if (name == "KEY_G")         return KEY_G;
-    if (name == "KEY_H")         return KEY_H;
-    if (name == "KEY_I")         return KEY_I;
-    if (name == "KEY_J")         return KEY_J;
-    if (name == "KEY_K")         return KEY_K;
-    if (name == "KEY_L")         return KEY_L;
-    if (name == "KEY_M")         return KEY_M;
-    if (name == "KEY_N")         return KEY_N;
-    if (name == "KEY_O")         return KEY_O;
-    if (name == "KEY_P")         return KEY_P;
-    if (name == "KEY_Q")         return KEY_Q;
-    if (name == "KEY_R")         return KEY_R;
-    if (name == "KEY_S")         return KEY_S;
-    if (name == "KEY_T")         return KEY_T;
-    if (name == "KEY_U")         return KEY_U;
-    if (name == "KEY_V")         return KEY_V;
-    if (name == "KEY_W")         return KEY_W;
-    if (name == "KEY_X")         return KEY_X;
-    if (name == "KEY_Y")         return KEY_Y;
-    if (name == "KEY_Z")         return KEY_Z;
-    if (name == "KEY_0")         return KEY_0;
-    if (name == "KEY_1")         return KEY_1;
-    if (name == "KEY_2")         return KEY_2;
-    if (name == "KEY_3")         return KEY_3;
-    if (name == "KEY_4")         return KEY_4;
-    if (name == "KEY_5")         return KEY_5;
-    if (name == "KEY_6")         return KEY_6;
-    if (name == "KEY_7")         return KEY_7;
-    if (name == "KEY_8")         return KEY_8;
-    if (name == "KEY_9")         return KEY_9;
-    std::fprintf(stderr, "[main] 未知键码名 '%s'，使用默认键\n", name.c_str());
-    return fallback;
-}
-
-// 从 JSON 文本中提取字符串值："key" : "value"
-// 说明：与 gesture_fsm.cpp 的 jsonGetFloat 同思路的轻量解析，仅取字符串字段
-static bool jsonGetString(const std::string& json, const std::string& key, std::string& out) {
-    std::string pattern = "\"" + key + "\"";
-    size_t pos = json.find(pattern);
-    if (pos == std::string::npos) return false;
-    pos = json.find(':', pos);
-    if (pos == std::string::npos) return false;
-    ++pos;
-    // 跳过空白
-    while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t' || json[pos] == '\n')) ++pos;
-    if (pos >= json.size() || json[pos] != '"') return false;
-    ++pos;  // 跳过开引号
-    size_t end = json.find('"', pos);
-    if (end == std::string::npos) return false;
-    out = json.substr(pos, end - pos);
-    return true;
-}
-
-// 加载手势→按键映射（从 gesture_config.json 的 key_map 字段）
-// @param configPath 配置文件路径
-// @param out 输出的按键映射
-// @return true 成功（未找到 key_map 时用默认值也算成功）
-static bool loadKeyMap(const std::string& configPath, KeyMapConfig& out) {
-    std::ifstream f(configPath);
-    if (!f.good()) {
-        std::fprintf(stderr, "[main] 按键映射配置读取失败: %s\n", configPath.c_str());
-        return false;
-    }
-    std::stringstream ss;
-    ss << f.rdbuf();
-    std::string json = ss.str();
-
-    std::string nameL, nameR, nameC;
-    if (jsonGetString(json, "swipe_left", nameL))  out.swipeLeft  = keyNameToCode(nameL, KEY_LEFT);
-    if (jsonGetString(json, "swipe_right", nameR)) out.swipeRight = keyNameToCode(nameR, KEY_RIGHT);
-    if (jsonGetString(json, "confirm", nameC))     out.confirm    = keyNameToCode(nameC, KEY_ENTER);
-
-    std::printf("[main] 按键映射: 左滑=%s 右滑=%s 确认=%s\n",
-                nameL.empty() ? "KEY_LEFT" : nameL.c_str(),
-                nameR.empty() ? "KEY_RIGHT" : nameR.c_str(),
-                nameC.empty() ? "KEY_ENTER" : nameC.c_str());
-    return true;
-}
-
-// 事件转字符串（供日志打印）
+// 事件转字符串（供日志打印，v2 单指方案）
 static const char* eventToString(GestureEvent e) {
     switch (e) {
-        case GestureEvent::kNone:          return "无";
-        case GestureEvent::kFistHold:      return "握拳长按(锁定/解锁)";
-        case GestureEvent::kOpenPalm:      return "五指张开(鼠标跟随)";
-        case GestureEvent::kFistShort:     return "握拳短按(左键单击)";
-        case GestureEvent::kFistDragStart: return "握拳拖拽开始";
-        case GestureEvent::kFistDragMove:  return "握拳拖拽移动";
-        case GestureEvent::kFistDragEnd:   return "握拳拖拽结束";
-        case GestureEvent::kOkGesture:     return "OK(右键)";
-        case GestureEvent::kIndexSwipe:    return "食指滑动(翻页)";
-        case GestureEvent::kThumbUp:       return "竖拇指(回车)";
+        case GestureEvent::kNone:        return "无";
+        case GestureEvent::kFistHold:    return "握拳长按(锁定/解锁)";
+        case GestureEvent::kPointerMove: return "食指定位移动";
+        case GestureEvent::kClick:       return "食指点击(左键)";
+        case GestureEvent::kDragStart:   return "拖拽开始";
+        case GestureEvent::kDragMove:    return "拖拽移动";
+        case GestureEvent::kDragEnd:     return "拖拽结束";
     }
     return "未知";
 }

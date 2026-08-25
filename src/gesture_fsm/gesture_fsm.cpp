@@ -1,11 +1,16 @@
 // ============================================================================
 // gesture_fsm/gesture_fsm.cpp
-// 作用：GestureFSM 类实现（项目核心模块）。
+// 作用：GestureFSM 类实现（v2 单指控制方案核心模块）。
 // 职责：
-//   1. 加载 JSON 配置（所有手势阈值外置）
+//   1. 加载 JSON 配置（所有阈值外置）
 //   2. 对 21 关键点做卡尔曼平滑
-//   3. 依据状态机迁移规则与 6 种手势判定输出 GestureEvent
-// 所有判定阈值来自 config/gesture_config.json，代码无硬编码魔法数字。
+//   3. 依据新状态机输出 v2 事件：锁定/解锁、绝对定位移动、单击、拖拽
+//
+// v2 点击/拖拽检测原理（基于食指尖 y 方向运动）：
+//   图像坐标系 y 向下为正，食指尖"下点"时 y 增大、抬起时 y 减小。
+//   - 下压速度 = 食指尖 y 的帧间变化率，超过 clickPressSpeedPx 判定为"按下"
+//   - 按下后短时间内（clickPressTimeMs）回弹 → 单击
+//   - 按下后持续按住 → 进入拖拽（左键保持），移动跟手，抬起结束
 // ============================================================================
 
 #include "gesture_fsm/gesture_fsm.h"
@@ -16,15 +21,12 @@
 #include <algorithm>
 #include <sys/stat.h>   // stat：配置热加载需要读取文件 mtime
 // 简易 JSON 解析（轻量依赖，避免引入 nlohmann/json）
-// 实现思路：本文件只需读取固定字段的数值，用最简单的字符串查找 + strtod
-//           实现。后续若配置复杂度提升可替换为 nlohmann/json。
 #include <sstream>
 
 namespace hand_ctrl {
 
 // --------------------------- 简易 JSON 数值解析工具 ---------------------------
 // 在 JSON 文本中查找 "key":数值 模式并返回数值
-// 说明：本实现为轻量解析，仅支持数值类型，足够本项目配置需求
 static bool jsonGetFloat(const std::string& json, const std::string& key, float& out) {
     std::string pattern = "\"" + key + "\"";
     size_t pos = json.find(pattern);
@@ -67,25 +69,20 @@ bool GestureFSM::loadConfig(const std::string& configPath) {
         m_configMtime = static_cast<long>(st.st_mtime);
     }
 
-    // 2. 解析各字段（嵌套字段用统一查找方式，无重复 key 冲突）
+    // 2. 解析各字段（key 名与 gesture_config.json 中一致）
     jsonGetInt  (json, "hold_time_ms",          m_cfg.lockHoldMs);
     jsonGetInt  (json, "state_cooldown_ms",     m_cfg.stateCooldownMs);
-    jsonGetFloat(json, "process_noise",        m_cfg.kalmanProcessNoise);
-    jsonGetFloat(json, "measure_noise",        m_cfg.kalmanMeasureNoise);
-    jsonGetInt  (json, "fist_distance_threshold_px",    m_cfg.fistDistThreshold);
-    jsonGetInt  (json, "finger_distance_threshold_px", m_cfg.openPalmDistThreshold);
-    jsonGetInt  (json, "hold_short_ms",                 m_cfg.fistShortMs);
-    jsonGetInt  (json, "thumb_index_gap_px",           m_cfg.okGestureGapPx);
-    jsonGetInt  (json, "wrist_stable_px",              m_cfg.swipeWristStablePx);
-    jsonGetFloat(json, "horizontal_ratio",            m_cfg.swipeHorizontalRatio);
-    jsonGetFloat(json, "thumb_extended_ratio",        m_cfg.thumbExtendedRatio);
-    jsonGetInt  (json, "other_fingers_fold_threshold", m_cfg.otherFingersFoldPx);
-    // 注意：以下 key 名与 gesture_config.json 中的嵌套结构字段名一致
-    //   drag.unlock_static_px、mouse.sensitivity（轻量解析器按字段名全局查找）
-    jsonGetInt  (json, "unlock_static_px",            m_cfg.dragUnlockStaticPx);
-    jsonGetFloat(json, "sensitivity",                 m_cfg.mouseSensitivity);
-    jsonGetInt  (json, "width",                       m_cfg.imageWidth);
-    jsonGetInt  (json, "height",                      m_cfg.imageHeight);
+    jsonGetFloat(json, "process_noise",         m_cfg.kalmanProcessNoise);
+    jsonGetFloat(json, "measure_noise",         m_cfg.kalmanMeasureNoise);
+    jsonGetInt  (json, "distance_threshold_px", m_cfg.fistDistThreshold);
+    jsonGetFloat(json, "press_speed_px",        m_cfg.clickPressSpeedPx);
+    jsonGetInt  (json, "press_time_ms",         m_cfg.clickPressTimeMs);
+    jsonGetInt  (json, "release_time_ms",       m_cfg.clickReleaseTimeMs);
+    jsonGetInt  (json, "width",                 m_cfg.imageWidth);
+    jsonGetInt  (json, "height",                m_cfg.imageHeight);
+    // 屏幕分辨率在嵌套字段 screen.width / screen.height（轻量解析按 key 全局查找）
+    jsonGetInt  (json, "screen_width",          m_cfg.screenWidth);
+    jsonGetInt  (json, "screen_height",         m_cfg.screenHeight);
 
     // 3. 用配置初始化所有卡尔曼滤波器
     for (int i = 0; i < kHandKeypointCount; ++i) {
@@ -93,31 +90,26 @@ bool GestureFSM::loadConfig(const std::string& configPath) {
     }
 
     m_cfgLoaded = true;
-    std::printf("[GestureFSM] 配置加载成功: %s\n", configPath.c_str());
-    std::printf("[GestureFSM] 锁定阈值=%dms, 握拳距离=%dpx, 滑动比例=%.2f\n",
-                m_cfg.lockHoldMs, m_cfg.fistDistThreshold, m_cfg.swipeHorizontalRatio);
+    std::printf("[GestureFSM] 配置加载成功(v2): %s\n", configPath.c_str());
+    std::printf("[GestureFSM] 锁定阈值=%dms 屏幕=%dx%d 下压速度=%.0fpx/s\n",
+                m_cfg.lockHoldMs, m_cfg.screenWidth, m_cfg.screenHeight,
+                m_cfg.clickPressSpeedPx);
     return true;
 }
 
 // --------------------------- 配置热加载 ---------------------------
 bool GestureFSM::reloadIfChanged() {
-    // 未加载过配置（路径为空）时不检测
     if (m_configPath.empty()) return false;
 
-    // 读取当前文件 mtime，与上次记录对比
     struct stat st;
     if (::stat(m_configPath.c_str(), &st) != 0) {
-        // 文件被删除/不可访问：不重载，保持现有配置（避免误删后程序失配）
-        return false;
+        return false;  // 文件不可访问：不重载，保持现有配置
     }
     long curMtime = static_cast<long>(st.st_mtime);
     if (curMtime == m_configMtime) {
-        return false;  // 无变更
+        return false;
     }
 
-    // 配置有变更：重新加载全部阈值
-    // 说明：kalman 滤波器会随配置重新 init（过程/测量噪声可能被调整），
-    //       短暂抖动属正常现象。
     std::printf("[GestureFSM] 检测到配置变更，正在热加载...\n");
     bool ok = loadConfig(m_configPath);
     if (ok) {
@@ -130,7 +122,7 @@ bool GestureFSM::reloadIfChanged() {
 
 // --------------------------- 卡尔曼平滑 ---------------------------
 void GestureFSM::smoothKeypoints(const HandKeypoints& in, HandKeypoints& out) {
-    out = in;  // 复制基础字段（valid/confidence）
+    out = in;
     if (in.points.size() < kHandKeypointCount) {
         out.points = in.points;
         return;
@@ -152,112 +144,29 @@ float GestureFSM::distance(float x1, float y1, float x2, float y2) {
     return std::sqrt(dx * dx + dy * dy);
 }
 
-// --------------------------- 6 种手势判定 ---------------------------
-// 1. 握拳：所有指尖(4,8,12,16,20)到手腕(0)的距离均 < fistDistThreshold
-//    注意：双模型模式下脸部已被 palm 检测过滤（valid=0），此处仅保留
-//          "指尖收拢到手腕附近"这一核心判据 + 手部跨度兜底，避免误杀真手。
+// --------------------------- 握拳判定 ---------------------------
 bool GestureFSM::detectFistHold(const HandKeypoints& kp) {
     if (kp.points.size() < 21) return false;
     const auto& w = kp.points[0];  // 手腕
     const int tips[] = {4, 8, 12, 16, 20};  // 5 个指尖索引
 
-    // 核心判据：5 个指尖到手腕距离均小于阈值（握拳时指尖收拢到掌心附近）
     float maxTipDist = 0.f;
     for (int t : tips) {
         float d = distance(kp.points[t].x, kp.points[t].y, w.x, w.y);
         if (d >= m_cfg.fistDistThreshold) return false;
         maxTipDist = std::max(maxTipDist, d);
     }
-    // 手部跨度兜底检查：跨度太小视为噪声/无效关键点，过大视为误判区域
-    // （双模型下 palm 已过滤脸部，此检查仅为极端异常兜底）
-    const float minHandSpan = 30.f;   // 手部最小跨度（像素）
-    const float maxHandSpan = 400.f;  // 手部最大跨度（像素，放宽避免误杀）
+    // 手部跨度兜底：跨度过小视为噪声/无效关键点，过大视为误判区域
+    const float minHandSpan = 30.f;
+    const float maxHandSpan = 400.f;
     if (maxTipDist < minHandSpan || maxTipDist > maxHandSpan) return false;
-    return true;
-}
-
-// 2. 五指张开：所有指尖到手腕距离均 > openPalmDistThreshold
-bool GestureFSM::detectOpenPalm(const HandKeypoints& kp) {
-    if (kp.points.size() < 21) return false;
-    const auto& w = kp.points[0];
-    const int tips[] = {4, 8, 12, 16, 20};
-    for (int t : tips) {
-        float d = distance(kp.points[t].x, kp.points[t].y, w.x, w.y);
-        if (d <= m_cfg.openPalmDistThreshold) return false;
-    }
-    return true;
-}
-
-// 3. OK 手势：拇指尖(4)与食指尖(8)距离 < okGestureGapPx
-bool GestureFSM::detectOkGesture(const HandKeypoints& kp) {
-    if (kp.points.size() < 21) return false;
-    float d = distance(kp.points[4].x, kp.points[4].y,
-                       kp.points[8].x, kp.points[8].y);
-    return d < m_cfg.okGestureGapPx;
-}
-
-// 4. 食指横向滑动：手腕静止 + 食指尖横向位移 >= 图像宽度 * horizontalRatio
-//    说明：此处返回 true 时，方向（左/右）需由调用方根据位移正负判断
-bool GestureFSM::detectIndexSwipe(const HandKeypoints& kp, double dtMs) {
-    if (kp.points.size() < 21) return false;
-    const auto& wrist = kp.points[0];
-    const auto& indexTip = kp.points[8];
-
-    // 首帧：记录初始位置，不判定
-    if (m_lastWristX < 0) {
-        m_lastWristX = wrist.x;
-        m_lastWristY = wrist.y;
-        m_lastIndexTipX = indexTip.x;
-        m_lastIndexTipY = indexTip.y;
-        return false;
-    }
-
-    // 检查手腕是否基本静止
-    float wristMove = distance(wrist.x, wrist.y, m_lastWristX, m_lastWristY);
-    if (wristMove > m_cfg.swipeWristStablePx) {
-        // 手腕动了，重置参考点
-        m_lastWristX = wrist.x;
-        m_lastWristY = wrist.y;
-        m_lastIndexTipX = indexTip.x;
-        m_lastIndexTipY = indexTip.y;
-        return false;
-    }
-
-    // 计算食指尖相对参考点的横向位移
-    float dx = indexTip.x - m_lastIndexTipX;
-    float threshold = m_cfg.imageWidth * m_cfg.swipeHorizontalRatio;
-    if (std::fabs(dx) >= threshold) {
-        // 满足滑动条件，重置参考点（避免重复触发）
-        m_lastWristX = wrist.x;
-        m_lastWristY = wrist.y;
-        m_lastIndexTipX = indexTip.x;
-        m_lastIndexTipY = indexTip.y;
-        return true;
-    }
-    return false;
-}
-
-// 5. 竖拇指：拇指伸直（指尖到手腕距离 > 拇指根到手腕距离 * ratio）
-//          且其余四指折叠（指尖到手腕距离 < otherFingersFoldPx）
-bool GestureFSM::detectThumbUp(const HandKeypoints& kp) {
-    if (kp.points.size() < 21) return false;
-    const auto& w = kp.points[0];
-    // 拇指尖(4)到手腕距离 vs 拇指根(2, MCP)到手腕距离
-    float thumbTipDist = distance(kp.points[4].x, kp.points[4].y, w.x, w.y);
-    float thumbBaseDist = distance(kp.points[2].x, kp.points[2].y, w.x, w.y);
-    if (thumbTipDist < thumbBaseDist * m_cfg.thumbExtendedRatio) return false;
-
-    // 其余四指（食指8、中指12、无名指16、小指20）到手腕距离 < 阈值
-    const int otherTips[] = {8, 12, 16, 20};
-    for (int t : otherTips) {
-        float d = distance(kp.points[t].x, kp.points[t].y, w.x, w.y);
-        if (d >= m_cfg.otherFingersFoldPx) return false;
-    }
     return true;
 }
 
 // --------------------------- 状态机主循环 ---------------------------
 GestureEvent GestureFSM::handleFrame(const HandKeypoints& kpRaw, double dtMs) {
+    if (dtMs <= 0) dtMs = 1.0;  // 防御：避免除零
+
     // 未加载配置时使用默认参数（避免崩溃）
     if (!m_cfgLoaded) {
         for (int i = 0; i < kHandKeypointCount; ++i) {
@@ -270,39 +179,27 @@ GestureEvent GestureFSM::handleFrame(const HandKeypoints& kpRaw, double dtMs) {
     HandKeypoints kp;
     smoothKeypoints(kpRaw, kp);
 
-    // 2. 手不存在或置信度过低时的状态处理
-    //    置信度过滤：landmark 模型输出2 为手部置信度，脸部误判时该分数低。
-    //    阈值 0.5：真手 >0.8，脸部 <0.3（实测差异明显）。低于阈值视为"无手"。
+    // 2. 手不存在或置信度过低：重置全部状态，若拖拽中先强制结束
     bool lowConfidence = (kpRaw.confidence < 0.5f);
     if (!kp.valid || kp.points.size() < kHandKeypointCount || lowConfidence) {
-        // 手丢失/低置信度：重置握拳计时、滑动参考点
         m_fistHoldMs = 0;
-        m_lastWristX = -1.f;
-        // 若正在拖拽：先发拖拽结束事件，通知上层释放左键（防止鼠标卡在按下状态）
         GestureEvent lostEvent = GestureEvent::kNone;
-        if (m_dragging) {
+        if (m_dragging || m_pressActive) {
             m_dragging = false;
-            m_dragMoveAccum = 0.f;
-            m_lastDragPalmX = -1.f;
-            m_lastDragPalmY = -1.f;
-            lostEvent = GestureEvent::kFistDragEnd;
+            m_pressActive = false;
+            m_pressHoldMs = 0;
+            lostEvent = GestureEvent::kDragEnd;
             std::printf("[FSM] 手丢失，拖拽强制结束\n");
         }
-        if (m_state == CtrlState::kLockWait) {
-            m_state = CtrlState::kIdle;
+        m_lastIndexTipX = -1.f;
+        m_lastIndexTipY = -1.f;
+        if (m_state == CtrlState::kLocked) {
+            m_state = CtrlState::kIdle;  // 手丢失回到空闲，避免误操作
         }
         return lostEvent;
     }
 
-    // 3. 当前帧各手势判定结果
-    bool isFist      = detectFistHold(kp);
-    bool isOpenPalm  = detectOpenPalm(kp);
-    bool isOk        = detectOkGesture(kp);
-    bool isSwipe     = detectIndexSwipe(kp, dtMs);
-    bool isThumbUp   = detectThumbUp(kp);
-
-    // 4. 状态机迁移
-    // 冷却计时递减（每帧执行，防抖）
+    // 3. 冷却计时递减（每帧执行，防抖）
     if (m_cooldownMs > 0) {
         m_cooldownMs -= static_cast<int>(dtMs);
         if (m_cooldownMs < 0) m_cooldownMs = 0;
@@ -312,120 +209,93 @@ GestureEvent GestureFSM::handleFrame(const HandKeypoints& kpRaw, double dtMs) {
     switch (m_state) {
         case CtrlState::kIdle:
             // IDLE 态：只响应握拳长按触发锁定
-            if (isFist) {
+            if (detectFistHold(kp)) {
                 m_fistHoldMs += static_cast<int>(dtMs);
-                // 调试日志：握拳累计时长（每 300ms 打印一次，便于观察是否持续）
-                if (m_fistHoldMs % 300 < static_cast<int>(dtMs)) {
-                    std::printf("[FSM] IDLE 握拳累计 %dms / %dms\n", m_fistHoldMs, m_cfg.lockHoldMs);
-                }
                 if (m_fistHoldMs >= m_cfg.lockHoldMs && m_cooldownMs <= 0) {
                     m_state = CtrlState::kLocked;
                     m_fistHoldMs = 0;
-                    m_cooldownMs = m_cfg.stateCooldownMs;  // 进入冷却，防止快速切换
-                    event = GestureEvent::kFistHold;  // 通知上层：已锁定
+                    m_cooldownMs = m_cfg.stateCooldownMs;
+                    event = GestureEvent::kFistHold;
                     std::printf("[FSM] 状态迁移：IDLE → LOCKED（已锁定）\n");
                 }
             } else {
-                // 衰减容忍：短暂松开（帧间抖动）只衰减 30ms（约 1 帧），不清零
-                // 背景：VMware 摄像头帧率不稳，单模型模式关键点偶发抖动，
-                //       直接清零会导致握拳计时频繁重置，无法达到 1.2s 锁定阈值。
+                // 衰减容忍：短暂松开（帧间抖动）只衰减 30ms 不清零
                 m_fistHoldMs = (m_fistHoldMs > 30) ? (m_fistHoldMs - 30) : 0;
             }
             break;
 
-        case CtrlState::kLockWait:
-            // 简化实现：IDLE 已直接跳到 LOCKED，本态暂不进入
-            break;
-
         case CtrlState::kLocked:
-            // LOCKED 态：响应所有手势
-            if (isFist) {
-                // ---- 握拳持续：拖拽 / 解锁 / 短按判定 ----
+            // LOCKED 态：握拳解锁 / 单指控制（定位/点击/拖拽）
+            if (detectFistHold(kp)) {
+                // ---- 握拳：累计长按解锁 ----
                 m_fistHoldMs += static_cast<int>(dtMs);
-
-                if (!m_dragging && m_fistHoldMs >= m_cfg.fistShortMs) {
-                    // 握拳超过短按阈值（0.5s）且未在拖拽 → 进入拖拽模式
-                    m_dragging = true;
-                    m_dragMoveAccum = 0.f;
-                    m_lastDragPalmX = (kp.points.size() > 9) ? kp.points[9].x : -1.f;
-                    m_lastDragPalmY = (kp.points.size() > 9) ? kp.points[9].y : -1.f;
-                    event = GestureEvent::kFistDragStart;  // 通知上层：按住左键
-                    std::printf("[FSM] 拖拽开始\n");
-                    break;  // 本帧已产生事件，跳出 switch
-                }
-
-                if (m_dragging) {
-                    // 累计拖拽期间掌心（点9）位移，用于"静止解锁"判定
-                    if (kp.points.size() > 9 && m_lastDragPalmX >= 0) {
-                        float dx = kp.points[9].x - m_lastDragPalmX;
-                        float dy = kp.points[9].y - m_lastDragPalmY;
-                        m_dragMoveAccum += std::sqrt(dx * dx + dy * dy);
-                    }
-                    if (kp.points.size() > 9) {
-                        m_lastDragPalmX = kp.points[9].x;
-                        m_lastDragPalmY = kp.points[9].y;
-                    }
-                    // 拖拽中：若手基本静止且握拳总时长 ≥ lockHoldMs → 解锁
-                    // （避免拖拽移动被误判为解锁：移动累计超阈值则不解锁）
-                    if (m_fistHoldMs >= m_cfg.lockHoldMs &&
-                        m_dragMoveAccum < m_cfg.dragUnlockStaticPx &&
-                        m_cooldownMs <= 0) {
-                        m_state = CtrlState::kIdle;
-                        m_dragging = false;
-                        m_fistHoldMs = 0;
-                        m_cooldownMs = m_cfg.stateCooldownMs;
-                        event = GestureEvent::kFistHold;  // 通知上层：已解锁
-                        std::printf("[FSM] 状态迁移：LOCKED → IDLE（拖拽静止解锁）\n");
-                    } else {
-                        event = GestureEvent::kFistDragMove;  // 拖拽中：每帧跟随移动
-                    }
-                    break;  // 本帧已产生事件，跳出 switch
-                }
-
-                // 握拳 <0.5s（未达拖拽阈值）：仅累计时长，事件在松开时触发
-                // 同时保留旧逻辑兜底：握拳 ≥lockHoldMs 且未拖拽时也解锁
                 if (m_fistHoldMs >= m_cfg.lockHoldMs && m_cooldownMs <= 0) {
                     m_state = CtrlState::kIdle;
                     m_fistHoldMs = 0;
                     m_cooldownMs = m_cfg.stateCooldownMs;
+                    // 若此前在按下/拖拽，先强制结束（防止左键卡死）
+                    m_pressActive = false;
+                    m_pressHoldMs = 0;
+                    m_dragging = false;
                     event = GestureEvent::kFistHold;
                     std::printf("[FSM] 状态迁移：LOCKED → IDLE（已解锁）\n");
                 }
-            } else {
-                // ---- 握拳释放 ----
-                if (m_dragging) {
-                    // 拖拽中松开：结束拖拽，释放左键
-                    m_dragging = false;
-                    m_fistHoldMs = 0;
-                    m_dragMoveAccum = 0.f;
-                    m_lastDragPalmX = -1.f;
-                    m_lastDragPalmY = -1.f;
-                    event = GestureEvent::kFistDragEnd;
-                    std::printf("[FSM] 拖拽结束\n");
-                } else if (m_fistHoldMs > 0 && m_fistHoldMs < m_cfg.fistShortMs) {
-                    // 短按（0~0.5s）松开：左键单击
-                    event = GestureEvent::kFistShort;
-                }
-                // 衰减容忍：短暂松开只衰减 30ms 不清零（与 IDLE 态一致）
-                m_fistHoldMs = (m_fistHoldMs > 30) ? (m_fistHoldMs - 30) : 0;
+                // 握拳期间不响应定位/点击（手已收起）
+                break;
             }
-            // 其他手势判定（仅在未握拳、未拖拽时生效）
-            if (!isFist && !m_dragging) {
-                if (isOpenPalm) {
-                    event = GestureEvent::kOpenPalm;
-                } else if (isOk) {
-                    event = GestureEvent::kOkGesture;
-                } else if (isSwipe) {
-                    event = GestureEvent::kIndexSwipe;
-                } else if (isThumbUp) {
-                    event = GestureEvent::kThumbUp;
-                }
-            }
-            break;
 
-        case CtrlState::kTrigger:
-            // 瞬时态：直接回 LOCKED
-            m_state = CtrlState::kLocked;
+            // ---- 非握拳：单指控制 ----
+            // 记录平滑后食指尖（点8）坐标供上层绝对定位
+            m_smoothTipX = kp.points[8].x;
+            m_smoothTipY = kp.points[8].y;
+
+            // 食指尖 y 方向运动速度（图像 y 向下：下点为正）
+            float velY = 0.f;
+            if (m_lastIndexTipY >= 0) {
+                velY = (m_smoothTipY - m_lastIndexTipY) * 1000.f / static_cast<float>(dtMs);
+            }
+            m_lastIndexTipX = m_smoothTipX;
+            m_lastIndexTipY = m_smoothTipY;
+
+            if (!m_pressActive && !m_dragging) {
+                // ---- 空闲：检测下压（食指尖快速下点）----
+                if (velY > m_cfg.clickPressSpeedPx) {
+                    m_pressActive = true;
+                    m_pressHoldMs = 0;
+                    std::printf("[FSM] 按下开始（下压速度=%.0fpx/s）\n", velY);
+                } else {
+                    // 无操作：上报绝对定位移动
+                    event = GestureEvent::kPointerMove;
+                }
+            } else if (m_dragging) {
+                // ---- 拖拽中：检测抬起结束 ----
+                if (velY < -m_cfg.clickPressSpeedPx * 0.5f) {
+                    m_dragging = false;
+                    m_pressActive = false;
+                    m_pressHoldMs = 0;
+                    event = GestureEvent::kDragEnd;
+                    std::printf("[FSM] 拖拽结束（指尖抬起）\n");
+                } else {
+                    event = GestureEvent::kDragMove;  // 拖拽移动：跟手
+                }
+            } else {
+                // ---- 按下判定中：区分单击与拖拽 ----
+                m_pressHoldMs += static_cast<int>(dtMs);
+                if (velY < -m_cfg.clickPressSpeedPx * 0.5f && m_pressHoldMs < m_cfg.clickPressTimeMs) {
+                    // 快速回弹且未超时：单击
+                    m_pressActive = false;
+                    m_pressHoldMs = 0;
+                    event = GestureEvent::kClick;
+                    std::printf("[FSM] 单击\n");
+                } else if (m_pressHoldMs >= m_cfg.clickPressTimeMs) {
+                    // 按住超时：进入拖拽
+                    m_dragging = true;
+                    m_pressActive = false;
+                    event = GestureEvent::kDragStart;
+                    std::printf("[FSM] 拖拽开始（按住 %dms）\n", m_pressHoldMs);
+                }
+                // 其余情况：按下中尚未定性，保持等待（不发移动，避免点击时鼠标抖动）
+            }
             break;
     }
 
@@ -435,12 +305,15 @@ GestureEvent GestureFSM::handleFrame(const HandKeypoints& kpRaw, double dtMs) {
 // --------------------------- 状态查询 ---------------------------
 const char* GestureFSM::currentStateName() const {
     switch (m_state) {
-        case CtrlState::kIdle:     return "IDLE";
-        case CtrlState::kLockWait: return "LOCK_WAIT";
-        case CtrlState::kLocked:   return "LOCKED";
-        case CtrlState::kTrigger:  return "TRIGGER";
+        case CtrlState::kIdle:   return "IDLE";
+        case CtrlState::kLocked: return "LOCKED";
     }
     return "UNKNOWN";
+}
+
+void GestureFSM::lastIndexTip(float& x, float& y) const {
+    x = m_smoothTipX;
+    y = m_smoothTipY;
 }
 
 } // namespace hand_ctrl

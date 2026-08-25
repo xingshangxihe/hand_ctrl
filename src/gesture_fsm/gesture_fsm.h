@@ -1,25 +1,30 @@
 #pragma once
 // ============================================================================
 // gesture_fsm/gesture_fsm.h
-// 作用：手势有限状态机（项目核心模块）。
+// 作用：手势有限状态机（v2 单指控制方案核心模块）。
 //
-// 状态机设计：
-//   IDLE       空闲态，等待握拳长按触发锁定
-//     └─握拳持续≥lock_hold_time_ms──→ LOCK_WAIT
-//   LOCK_WAIT   等待锁定倒计时（1.2s）
-//     └─倒计时结束──→ LOCKED
-//     └─中途松开──→ IDLE
-//   LOCKED     锁定运行态，响应所有手势
-//     └─握拳≥lock_hold_time_ms──→ IDLE（解锁）
-//     └─任意手势触发──→ TRIGGER（瞬时态，输出事件后立即回 LOCKED）
+// v2 交互模型（方案A：单指绝对定位）：
+//   IDLE       空闲态：唯一手势 = 握拳长按锁定
+//     └─握拳持续≥lock_hold_ms──→ LOCKED
+//   LOCKED     锁定运行态：
+//     ├─ 握拳长按≥lock_hold_ms──→ IDLE（解锁）
+//     ├─ 非握拳（食指伸出）──→ 每帧上报 kPointerMove（食指尖绝对定位鼠标）
+//     ├─ 食指尖快速下压 ──→ 按下判定
+//     │    ├─ 在 press_time_ms 内回弹 ──→ kClick（单击）
+//     │    └─ 按住超过 press_time_ms ──→ kDragStart（拖拽开始）
+//     ├─ 拖拽中移动 ──→ kDragMove（食指尖跟手移动）
+//     └─ 拖拽中指尖抬起 ──→ kDragEnd（拖拽结束）
 //
-// 6 种手势判定（对应 config/gesture_config.json 的 gesture 字段）：
-//   1. fist_hold   握拳长按：锁定/解锁开关
-//   2. open_palm   五指张开：跟随鼠标移动
-//   3. fist_short  握拳短按：左键单击/拖拽
-//   4. ok_gesture  OK 手势：右键单击
-//   5. index_swipe 食指横向滑动：左右翻页
-//   6. thumb_up    竖拇指：回车确认
+// 事件输出：
+//   kFistHold     锁定/解锁开关（无 uinput 输出，仅状态切换）
+//   kPointerMove  鼠标绝对定位移动（上层用食指尖坐标映射屏幕）
+//   kClick        左键单击
+//   kDragStart    拖拽开始（左键按住）
+//   kDragMove     拖拽移动（左键保持 + 跟手）
+//   kDragEnd      拖拽结束（左键释放）
+//
+// 判定阈值全部来自 config/gesture_config.json（click.press_speed_px 等），
+// 代码中禁止硬编码魔法数字。
 //
 // MediaPipe Hands 21 关键点索引参考：
 //   0: WRIST（手腕）
@@ -38,57 +43,47 @@ namespace hand_ctrl {
 
 // 状态枚举（强类型，避免魔法数字）
 enum class CtrlState {
-    kIdle      = 0,   // 空闲：等待握拳长按触发锁定
-    kLockWait  = 1,   // 等待锁定倒计时
-    kLocked    = 2,   // 锁定运行：响应所有手势
-    kTrigger   = 3,   // 手势触发（瞬时态，输出事件后回 LOCKED）
+    kIdle   = 0,   // 空闲：等待握拳长按触发锁定
+    kLocked = 1,   // 锁定运行：响应单指控制（定位/点击/拖拽）
 };
 
-// 手势事件枚举：状态机对外输出的识别结果（与需求文档手势规则总表一一对应）
+// 手势事件枚举：状态机对外输出的识别结果（v2 单指方案）
 enum class GestureEvent {
-    kNone          = 0,   // 未识别到任何手势
-    kFistHold      = 1,   // 握拳长按：锁定/解锁开关（≥1.2s）
-    kOpenPalm      = 2,   // 五指张开：跟随鼠标移动
-    kFistShort     = 3,   // 握拳短按（0~0.5s 松开）：左键单击
-    kOkGesture     = 4,   // OK手势：右键单击
-    kIndexSwipe    = 5,   // 食指横向滑动：左右翻页
-    kThumbUp       = 6,   // 竖拇指：回车确认
-    kFistDragStart = 7,   // 握拳拖拽开始（按住 >0.5s）：按住左键
-    kFistDragMove  = 8,   // 握拳拖拽中：每帧跟随移动鼠标
-    kFistDragEnd   = 9,   // 握拳拖拽结束（松开）：释放左键
+    kNone        = 0,   // 无动作
+    kFistHold    = 1,   // 握拳长按：锁定/解锁开关（≥lock_hold_ms）
+    kPointerMove = 2,   // 食指定位移动（LOCKED 态每帧上报，供绝对定位）
+    kClick       = 3,   // 食指快速下点+回弹：左键单击
+    kDragStart   = 4,   // 食指下点按住（超 press_time_ms）：拖拽开始
+    kDragMove    = 5,   // 拖拽中移动（左键保持按下）
+    kDragEnd     = 6,   // 指尖抬起：拖拽结束（释放左键）
 };
 
 // JSON 配置参数集合（运行时加载，所有阈值外置）
 struct FsmConfig {
     // 锁定相关
-    int   lockHoldMs = 1200;            // 握拳长按锁定时长阈值（毫秒）
+    int   lockHoldMs = 1200;            // 握拳长按锁定/解锁时长阈值（毫秒）
     int   stateCooldownMs = 1500;       // 状态切换防抖冷却时间（毫秒）：锁定/解锁切换后
                                         // 此时间内不允许再次切换，防止脸部误判导致状态疯狂跳动
 
     // 卡尔曼滤波
     float kalmanProcessNoise = 1.0f;    // 过程噪声
-    float kalmanMeasureNoise = 4.0f;   // 测量噪声
+    float kalmanMeasureNoise = 4.0f;    // 测量噪声
 
-    // 手势阈值（像素/比例）
-    int   fistDistThreshold     = 60;  // 握拳距离阈值
-    int   openPalmDistThreshold = 100; // 五指张开距离阈值
-    int   fistShortMs           = 500; // 握拳短按判定时长
-    int   okGestureGapPx         = 30; // OK 手势拇指食指间距
-    int   swipeWristStablePx     = 15; // 滑动手腕静止阈值
-    float swipeHorizontalRatio  = 0.3f;// 滑动横向位移比例（相对图像宽度）
-    float thumbExtendedRatio    = 1.2f;// 拇指伸直判定比例
-    int   otherFingersFoldPx    = 80;  // 竖拇指时其余四指折叠阈值
+    // 握拳判定
+    int   fistDistThreshold = 160;      // 握拳距离阈值（像素）：所有指尖到手腕距离均小于此值
 
-    // 图像尺寸（用于比例计算）
+    // 点击/拖拽判定（v2 核心）
+    float clickPressSpeedPx = 60.f;     // 下压速度阈值（像素/秒）：食指尖 y 方向下落速度超此值判定"按下"
+    int   clickPressTimeMs  = 250;      // 按下后回弹最大时长（毫秒）：在此时长内抬起 = 单击
+    int   clickReleaseTimeMs = 250;     // 预留：回弹判定时长（当前与 press 共用）
+
+    // 图像尺寸（用于坐标映射比例计算）
     int   imageWidth  = 640;
     int   imageHeight = 480;
 
-    // 拖拽模式解锁判定：拖拽中若累计移动距离 < 此阈值（手静止握拳），
-    // 且握拳总时长 ≥ lockHoldMs，才触发解锁（避免拖拽移动被误判为解锁）
-    int   dragUnlockStaticPx = 80;
-
-    // 鼠标跟随灵敏度：掌心帧间位移（像素）× 此系数 = 鼠标相对位移
-    float mouseSensitivity = 0.8f;
+    // 目标屏幕分辨率（绝对定位映射目标）
+    int   screenWidth  = 1920;
+    int   screenHeight = 1080;
 };
 
 class GestureFSM {
@@ -102,19 +97,16 @@ public:
     bool loadConfig(const std::string& configPath);
 
     // 配置热加载：检测配置文件 mtime 是否变化，变化则自动重新加载全部阈值
-    // 说明：主循环每约 1s 调用一次即可实现"改配置实时生效"（阶段7 验收项）。
     // @return true 本次发生了重载（配置有变更），false 无变更
     bool reloadIfChanged();
 
     // 处理一帧关键点数据，驱动状态机推进
     // @param kp   当前帧的 21 个手部关键点（已由上层完成推理）
-    // @param dtMs 与上一帧的时间间隔（毫秒），用于时长类手势判定
+    // @param dtMs 与上一帧的时间间隔（毫秒），用于时长/速度类手势判定
     // @return 当前帧识别到的手势事件
     GestureEvent handleFrame(const HandKeypoints& kp, double dtMs);
 
     // 对 21 个关键点做卡尔曼平滑（在 handleFrame 内部调用，也可独立调用）
-    // @param in  原始关键点
-    // @param out 平滑后的关键点
     void smoothKeypoints(const HandKeypoints& in, HandKeypoints& out);
 
     // 查询当前状态机所处状态（调试/日志打印用）
@@ -123,38 +115,32 @@ public:
     // 获取当前状态（供上层决策使用）
     CtrlState currentState() const { return m_state; }
 
-    // 获取锁定倒计时剩余毫秒（LOCK_WAIT 状态下有意义）
-    int lockCountdownMs() const { return m_lockCountdownMs; }
+    // 获取平滑后的食指尖（点8）坐标，供上层做鼠标绝对定位
+    // @return 平滑后食指尖坐标；若未初始化返回 (-1,-1)
+    void lastIndexTip(float& x, float& y) const;
 
-    // 获取鼠标跟随灵敏度系数（供上层将掌心位移映射为鼠标位移）
-    float mouseSensitivity() const { return m_cfg.mouseSensitivity; }
+    // 获取屏幕分辨率（绝对定位映射目标）
+    int screenWidth() const  { return m_cfg.screenWidth; }
+    int screenHeight() const { return m_cfg.screenHeight; }
 
-    // 获取图像尺寸（供上层做比例计算）
+    // 获取图像尺寸（供上层做坐标映射）
     int imageWidth() const  { return m_cfg.imageWidth; }
     int imageHeight() const { return m_cfg.imageHeight; }
 
 private:
     // --------------------------- 状态成员 ---------------------------
     CtrlState m_state = CtrlState::kIdle;   // 当前状态
-    int       m_lockCountdownMs = 0;        // 锁定倒计时剩余（LOCK_WAIT 态）
     int       m_fistHoldMs = 0;             // 握拳持续累计时长（毫秒）
+    int       m_cooldownMs = 0;             // 状态切换防抖冷却计时器（毫秒）
 
-    // 食指滑动检测：记录上一帧食指尖位置，用于计算横向位移
-    float     m_lastIndexTipX = -1.f;
-    float     m_lastIndexTipY = -1.f;
-    float     m_lastWristX = -1.f;
-    float     m_lastWristY = -1.f;
-
-    // 状态切换防抖冷却计时器（毫秒）：状态迁移后置为 cooldown 值，每帧递减
-    int m_cooldownMs = 0;
-
-    // 握拳拖拽状态：false=未拖拽，true=正在拖拽（左键按住中）
-    bool m_dragging = false;
-    // 拖拽期间累计移动距离（像素）：用于"手静止握拳长按"解锁判定
-    float m_dragMoveAccum = 0.f;
-    // 拖拽期间上一帧掌心（点9）坐标：用于累计位移
-    float m_lastDragPalmX = -1.f;
-    float m_lastDragPalmY = -1.f;
+    // 点击/拖拽检测状态（v2 核心）
+    bool  m_pressActive = false;            // 是否处于"按下"判定中
+    int   m_pressHoldMs = 0;                // 按下持续累计时长（毫秒）
+    bool  m_dragging = false;               // 是否正在拖拽（左键按住中）
+    float m_lastIndexTipX = -1.f;           // 上一帧食指尖 X（用于移动判定）
+    float m_lastIndexTipY = -1.f;           // 上一帧食指尖 Y（用于下压速度判定）
+    float m_smoothTipX = -1.f;              // 平滑后食指尖 X（供上层绝对定位）
+    float m_smoothTipY = -1.f;              // 平滑后食指尖 Y
 
     // 卡尔曼滤波器数组：每个关键点一个
     KalmanFilter m_filters[kHandKeypointCount];
@@ -162,16 +148,12 @@ private:
     // 配置参数
     FsmConfig m_cfg;
     bool      m_cfgLoaded = false;
-    std::string m_configPath;   // 当前配置文件路径（热加载检测用）
-    long      m_configMtime = 0; // 配置文件的最后修改时间（mtime，热加载检测用）
+    std::string m_configPath;               // 当前配置文件路径（热加载检测用）
+    long      m_configMtime = 0;            // 配置文件的最后修改时间（mtime，热加载检测用）
 
     // --------------------------- 手势判定函数 ---------------------------
-    // 各手势判定返回 true 表示当前帧满足该手势条件
+    // 握拳判定：所有指尖(4,8,12,16,20)到手腕(0)距离均 < fistDistThreshold
     bool detectFistHold(const HandKeypoints& kp);
-    bool detectOpenPalm(const HandKeypoints& kp);
-    bool detectOkGesture(const HandKeypoints& kp);
-    bool detectIndexSwipe(const HandKeypoints& kp, double dtMs);
-    bool detectThumbUp(const HandKeypoints& kp);
 
     // 工具：计算两点欧式距离
     static float distance(float x1, float y1, float x2, float y2);
