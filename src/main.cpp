@@ -36,6 +36,7 @@
 #include <atomic>
 #include <cstdint>
 #include <algorithm>
+#include <cmath>
 #include <opencv2/opencv.hpp>
 
 #include "utils/common.h"
@@ -298,10 +299,20 @@ int main(int argc, char* argv[]) {
     bool  virtualInit = false;          // 锁定后首帧需初始化虚拟位置
     float moveAccumX = 0.f;             // 小数位移残差累积器（保证不丢步）
     float moveAccumY = 0.f;
+    // 位移 EMA 低通滤波（直线修正）：抑制手部高频抖动，
+    // 只有显著位移才注入，路径更直、更稳。
+    float smMoveX = 0.f;                // 平滑后位移（EMA 状态）
+    float smMoveY = 0.f;
+    // 拖拽期间隐藏画面窗口标志：拖拽时虚拟鼠标按住左键+移动，
+    // 若指针落在画面窗口上会触发 GTK 窗口交互（拖动/点击），导致画面消失。
+    // 方案：拖拽开始销毁窗口，结束立即重建，彻底避免冲突。
+    bool winHiddenForDrag = false;
     while (!g_shouldExit.load()) {
         // ---- 画面显示：放在循环最前，不依赖关键点队列（摄像头断流时也持续刷新）----
         // 说明：imshow/waitKey 必须在主线程调用（GTK 限制）；时间驱动每 40ms 刷新。
-        if (showGui) {
+        // 拖拽期间窗口已被销毁（winHiddenForDrag=true），跳过整个显示块；
+        // 同时窗口关闭检测也被跳过，避免把"拖拽销毁"误判为"用户点×关闭"。
+        if (showGui && !winHiddenForDrag) {
             auto nowD = std::chrono::steady_clock::now();
             double dispInterval = std::chrono::duration<double, std::milli>(nowD - lastDisplay).count();
             if (dispInterval >= 100.0) {  // 10fps，降低 VMware 渲染压力
@@ -481,9 +492,24 @@ int main(int argc, char* argv[]) {
                     // 目标位移 × 灵敏度（提高响应速度）
                     float wantDx = (targetX - virtualMouseX) * mouseSens;
                     float wantDy = (targetY - virtualMouseY) * mouseSens;
+                    // ---- 位移 EMA 低通滤波（直线修正）----
+                    // 手部抖动是高频噪声，直接注入会让鼠标路径"蛇形"。
+                    // 用指数滑动平均：sm = α×本次 + (1-α)×上次，抑制高频抖动。
+                    // α 越小越平滑（路径直）但响应稍慢，取 0.45 兼顾。
+                    const float kEmaAlpha = 0.45f;
+                    smMoveX = kEmaAlpha * wantDx + (1.f - kEmaAlpha) * smMoveX;
+                    smMoveY = kEmaAlpha * wantDy + (1.f - kEmaAlpha) * smMoveY;
+                    // 死区：平滑后位移过小则忽略（手微抖/停留时不产生漂移）
+                    if (std::fabs(smMoveX) < 0.4f && std::fabs(smMoveY) < 0.4f) {
+                        smMoveX = 0.f;
+                        smMoveY = 0.f;
+                        moveAccumX = 0.f;
+                        moveAccumY = 0.f;
+                        break;  // 本帧不注入位移
+                    }
                     // 累积小数残差，整数部分注入 uinput（避免连续取整丢步）
-                    moveAccumX += wantDx;
-                    moveAccumY += wantDy;
+                    moveAccumX += smMoveX;
+                    moveAccumY += smMoveY;
                     int dx = static_cast<int>(moveAccumX);
                     int dy = static_cast<int>(moveAccumY);
                     moveAccumX -= dx;
@@ -509,10 +535,24 @@ int main(int argc, char* argv[]) {
 
             case GestureEvent::kDragStart:
                 uinput.pressLeft();  // 拖拽开始：按住左键
+                // 拖拽期间隐藏画面窗口：拖拽时虚拟鼠标按住左键+移动，
+                // 若指针落在画面窗口上会触发 GTK 窗口交互（拖动/点击），
+                // 导致画面消失/卡顿。销毁窗口彻底避免冲突，结束拖拽立即恢复。
+                if (showGui && !winHiddenForDrag) {
+                    cv::destroyWindow("hand-ctrl");
+                    winHiddenForDrag = true;
+                    std::printf("[main] 拖拽中，画面窗口已隐藏\n");
+                }
                 break;
 
             case GestureEvent::kDragEnd:
                 uinput.releaseLeft();  // 拖拽结束：释放左键
+                // 拖拽结束立即恢复画面窗口
+                if (showGui && winHiddenForDrag) {
+                    cv::namedWindow("hand-ctrl", cv::WINDOW_NORMAL);
+                    winHiddenForDrag = false;
+                    std::printf("[main] 拖拽结束，画面窗口已恢复\n");
+                }
                 break;
 
             case GestureEvent::kNone:
