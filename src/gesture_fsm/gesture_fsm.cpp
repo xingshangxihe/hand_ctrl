@@ -1,16 +1,17 @@
 // ============================================================================
 // gesture_fsm/gesture_fsm.cpp
-// 作用：GestureFSM 类实现（v2 单指控制方案核心模块）。
+// 作用：GestureFSM 类实现（v2.1 捏合控制方案核心模块）。
 // 职责：
 //   1. 加载 JSON 配置（所有阈值外置）
 //   2. 对 21 关键点做卡尔曼平滑
-//   3. 依据新状态机输出 v2 事件：锁定/解锁、绝对定位移动、单击、拖拽
+//   3. 依据 v2.1 状态机输出事件：开掌锁定/解锁、捏合单击/拖拽、食指尖定位
 //
-// v2 点击/拖拽检测原理（基于食指尖 y 方向运动）：
-//   图像坐标系 y 向下为正，食指尖"下点"时 y 增大、抬起时 y 减小。
-//   - 下压速度 = 食指尖 y 的帧间变化率，超过 clickPressSpeedPx 判定为"按下"
-//   - 按下后短时间内（clickPressTimeMs）回弹 → 单击
-//   - 按下后持续按住 → 进入拖拽（左键保持），移动跟手，抬起结束
+// v2.1 捏合检测原理：
+//   点击动作 = "拇指+食指捏合"，与移动（手平移）完全正交：
+//   - 捏合距离 = 拇指尖(4)与食指尖(8)的欧式距离
+//   - 距离 < pinchDistThresholdPx → 捏合（按下）
+//   - 捏合保持超过 pinchHoldMs → 拖拽；在保持期内松开 → 单击
+//   - 平移手时捏合状态不变，移动永不误触发点击
 // ============================================================================
 
 #include "gesture_fsm/gesture_fsm.h"
@@ -26,7 +27,6 @@
 namespace hand_ctrl {
 
 // --------------------------- 简易 JSON 数值解析工具 ---------------------------
-// 在 JSON 文本中查找 "key":数值 模式并返回数值
 static bool jsonGetFloat(const std::string& json, const std::string& key, float& out) {
     std::string pattern = "\"" + key + "\"";
     size_t pos = json.find(pattern);
@@ -34,7 +34,6 @@ static bool jsonGetFloat(const std::string& json, const std::string& key, float&
     pos = json.find(':', pos);
     if (pos == std::string::npos) return false;
     ++pos;
-    // 跳过空白
     while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t' || json[pos] == '\n')) ++pos;
     try { out = std::stof(json.substr(pos)); } catch (...) { return false; }
     return true;
@@ -52,7 +51,6 @@ GestureFSM::~GestureFSM() = default;
 
 // --------------------------- 配置加载 ---------------------------
 bool GestureFSM::loadConfig(const std::string& configPath) {
-    // 1. 读取配置文件全部内容
     std::ifstream f(configPath);
     if (!f.good()) {
         std::fprintf(stderr, "[GestureFSM] 配置文件打开失败: %s\n", configPath.c_str());
@@ -62,39 +60,36 @@ bool GestureFSM::loadConfig(const std::string& configPath) {
     ss << f.rdbuf();
     std::string json = ss.str();
 
-    // 记录路径与 mtime（供热加载检测使用）
     m_configPath = configPath;
     struct stat st;
     if (::stat(configPath.c_str(), &st) == 0) {
         m_configMtime = static_cast<long>(st.st_mtime);
     }
 
-    // 2. 解析各字段（key 名与 gesture_config.json 中一致）
+    // 解析各字段（key 名与 gesture_config.json 一致）
     jsonGetInt  (json, "hold_time_ms",          m_cfg.lockHoldMs);
     jsonGetInt  (json, "state_cooldown_ms",     m_cfg.stateCooldownMs);
     jsonGetFloat(json, "process_noise",         m_cfg.kalmanProcessNoise);
     jsonGetFloat(json, "measure_noise",         m_cfg.kalmanMeasureNoise);
-    jsonGetFloat(json, "extension_ratio",       m_cfg.openPalmRatio);
-    jsonGetFloat(json, "press_speed_px",        m_cfg.clickPressSpeedPx);
-    jsonGetInt  (json, "press_time_ms",         m_cfg.clickPressTimeMs);
-    jsonGetInt  (json, "release_time_ms",       m_cfg.clickReleaseTimeMs);
-    jsonGetFloat(json, "sensitivity",           m_cfg.mouseSensitivity);
-    jsonGetInt  (json, "width",                 m_cfg.imageWidth);
-    jsonGetInt  (json, "height",                m_cfg.imageHeight);
-    // 屏幕分辨率在嵌套字段 screen.screen_width / screen.screen_height（轻量解析按 key 全局查找）
-    jsonGetInt  (json, "screen_width",          m_cfg.screenWidth);
-    jsonGetInt  (json, "screen_height",         m_cfg.screenHeight);
+    jsonGetFloat(json, "extension_ratio",              m_cfg.openPalmRatio);
+    jsonGetFloat(json, "pinch_distance_threshold_px", m_cfg.pinchDistThresholdPx);
+    jsonGetInt  (json, "pinch_hold_ms",               m_cfg.pinchHoldMs);
+    jsonGetFloat(json, "sensitivity",                 m_cfg.mouseSensitivity);
+    jsonGetInt  (json, "width",                       m_cfg.imageWidth);
+    jsonGetInt  (json, "height",                      m_cfg.imageHeight);
+    jsonGetInt  (json, "screen_width",                m_cfg.screenWidth);
+    jsonGetInt  (json, "screen_height",               m_cfg.screenHeight);
 
-    // 3. 用配置初始化所有卡尔曼滤波器
+    // 用配置初始化卡尔曼滤波器
     for (int i = 0; i < kHandKeypointCount; ++i) {
         m_filters[i].init(m_cfg.kalmanProcessNoise, m_cfg.kalmanMeasureNoise);
     }
 
     m_cfgLoaded = true;
-    std::printf("[GestureFSM] 配置加载成功(v2): %s\n", configPath.c_str());
-    std::printf("[GestureFSM] 锁定阈值=%dms 屏幕=%dx%d 下压速度=%.0fpx/s\n",
+    std::printf("[GestureFSM] 配置加载成功(v2.1): %s\n", configPath.c_str());
+    std::printf("[GestureFSM] 锁定阈值=%dms 屏幕=%dx%d 捏合距离=%.0fpx 灵敏度=%.2f\n",
                 m_cfg.lockHoldMs, m_cfg.screenWidth, m_cfg.screenHeight,
-                m_cfg.clickPressSpeedPx);
+                m_cfg.pinchDistThresholdPx, m_cfg.mouseSensitivity);
     return true;
 }
 
@@ -104,7 +99,7 @@ bool GestureFSM::reloadIfChanged() {
 
     struct stat st;
     if (::stat(m_configPath.c_str(), &st) != 0) {
-        return false;  // 文件不可访问：不重载，保持现有配置
+        return false;
     }
     long curMtime = static_cast<long>(st.st_mtime);
     if (curMtime == m_configMtime) {
@@ -146,20 +141,11 @@ float GestureFSM::distance(float x1, float y1, float x2, float y2) {
 }
 
 // --------------------------- 开掌判定（锁定/解锁手势） ---------------------------
-// 设计：v2 单指控制时手指常处于"食指伸直+其余弯曲"状态，与"握拳"在摄像头视角下
-//       难以可靠区分（尤其手指朝屏幕时投影缩短）。改用「五指张开」作为锁定/解锁手势：
-//       - 开掌 = 5 根手指全部伸直（各指尖到手腕距离 / 各指根 MCP 到手腕距离 > 阈值）
-//       - 单指控制 = 仅食指伸直，其余弯曲 → 不满足"全部伸直" → 不会误触锁定/解锁
-// 比值法对"手指朝屏幕"的透视投影等比缩短鲁棒（分子分母同缩，比值不变）。
-//
-// 注意（拇指特殊性）：拇指根(2)紧邻手腕，开掌时"拇指尖/拇指根"比值天然小于
-//       其余四指（其余四指根在手掌中部，手腕距指根本就有一定长度）。
-//       故拇指使用放宽阈值（openPalmRatio × 0.8），其余四指用标准阈值。
+// 5 指全部伸直（指尖/指根比值 > 阈值），拇指阈值放宽×0.8（其根紧邻手腕）
 bool GestureFSM::detectOpenPalm(const HandKeypoints& kp) {
     if (kp.points.size() < 21) return false;
     const auto& w = kp.points[0];  // 手腕
-    // 5 根手指的 [指尖, 指根 MCP] 索引对 + 是否拇指：
-    //   拇指(2=MCP, 4=TIP)、食指(5,8)、中指(9,12)、无名指(13,16)、小指(17,20)
+    // [指尖, 指根 MCP]：拇指(4,2)、食指(8,5)、中指(12,9)、无名指(16,13)、小指(20,17)
     const int tipBase[][2] = {
         {4, 2}, {8, 5}, {12, 9}, {16, 13}, {20, 17}
     };
@@ -168,20 +154,18 @@ bool GestureFSM::detectOpenPalm(const HandKeypoints& kp) {
         int tip = tipBase[i][0], base = tipBase[i][1];
         float tipToWrist = distance(kp.points[tip].x, kp.points[tip].y, w.x, w.y);
         float baseToWrist = distance(kp.points[base].x, kp.points[base].y, w.x, w.y);
-        if (baseToWrist < 1e-6f) return false;  // 指根异常（退化保护）
-        // 拇指阈值放宽（×0.8），其余四指用标准阈值
+        if (baseToWrist < 1e-6f) return false;
         float ratio = tipToWrist / baseToWrist;
         float threshold = (i == 0) ? (m_cfg.openPalmRatio * 0.8f) : m_cfg.openPalmRatio;
-        if (ratio < threshold) return false;  // 该指未伸直 → 非开掌
+        if (ratio < threshold) return false;
     }
     return true;  // 5 指全部伸直 = 开掌
 }
 
 // --------------------------- 状态机主循环 ---------------------------
 GestureEvent GestureFSM::handleFrame(const HandKeypoints& kpRaw, double dtMs) {
-    if (dtMs <= 0) dtMs = 1.0;  // 防御：避免除零
+    if (dtMs <= 0) dtMs = 1.0;
 
-    // 未加载配置时使用默认参数（避免崩溃）
     if (!m_cfgLoaded) {
         for (int i = 0; i < kHandKeypointCount; ++i) {
             m_filters[i].init(m_cfg.kalmanProcessNoise, m_cfg.kalmanMeasureNoise);
@@ -198,15 +182,13 @@ GestureEvent GestureFSM::handleFrame(const HandKeypoints& kpRaw, double dtMs) {
     if (!kp.valid || kp.points.size() < kHandKeypointCount || lowConfidence) {
         m_holdMs = 0;
         GestureEvent lostEvent = GestureEvent::kNone;
-        if (m_dragging || m_pressActive) {
+        if (m_dragging || m_pinching) {
             m_dragging = false;
-            m_pressActive = false;
-            m_pressHoldMs = 0;
+            m_pinching = false;
+            m_pinchHoldMs = 0;
             lostEvent = GestureEvent::kDragEnd;
             std::printf("[FSM] 手丢失，拖拽强制结束\n");
         }
-        m_lastIndexTipX = -1.f;
-        m_lastIndexTipY = -1.f;
         if (m_state == CtrlState::kLocked) {
             m_state = CtrlState::kIdle;  // 手丢失回到空闲，避免误操作
         }
@@ -222,23 +204,6 @@ GestureEvent GestureFSM::handleFrame(const HandKeypoints& kpRaw, double dtMs) {
     GestureEvent event = GestureEvent::kNone;
     switch (m_state) {
         case CtrlState::kIdle:
-            // 诊断日志：每 60 帧打印各手指"指尖/指根"比值（帮助调开掌阈值）
-            // 拇指阈值 = openPalmRatio×0.8，其余四指 = openPalmRatio
-            {
-                static int diagCnt = 0;
-                if (++diagCnt % 60 == 1) {
-                    const float f_th = m_cfg.openPalmRatio;
-                    float r[5];
-                    const int tb[][2] = {{4,2},{8,5},{12,9},{16,13},{20,17}};
-                    for (int i = 0; i < 5; ++i) {
-                        float a = distance(kp.points[tb[i][0]].x, kp.points[tb[i][0]].y, kp.points[0].x, kp.points[0].y);
-                        float b = distance(kp.points[tb[i][1]].x, kp.points[tb[i][1]].y, kp.points[0].x, kp.points[0].y);
-                        r[i] = (b > 1e-6f) ? a / b : 0.f;
-                    }
-                    std::printf("[FSM] 开掌诊断 拇/食/中/无/小 = %.2f/%.2f/%.2f/%.2f/%.2f (阈值 %.2f/%.2f)\n",
-                                r[0], r[1], r[2], r[3], r[4], f_th * 0.8f, f_th);
-                }
-            }
             // IDLE 态：开掌长按触发锁定
             if (detectOpenPalm(kp)) {
                 m_holdMs += static_cast<int>(dtMs);
@@ -250,13 +215,12 @@ GestureEvent GestureFSM::handleFrame(const HandKeypoints& kpRaw, double dtMs) {
                     std::printf("[FSM] 状态迁移：IDLE → LOCKED（已锁定）\n");
                 }
             } else {
-                // 衰减容忍：短暂变化（帧间抖动）只衰减 30ms 不清零
                 m_holdMs = (m_holdMs > 30) ? (m_holdMs - 30) : 0;
             }
             break;
 
         case CtrlState::kLocked:
-            // LOCKED 态：开掌解锁 / 单指控制（定位/点击/拖拽）
+            // LOCKED 态：开掌解锁 / 捏合控制（定位/单击/拖拽）
             if (detectOpenPalm(kp)) {
                 // ---- 开掌：累计长按解锁 ----
                 m_holdMs += static_cast<int>(dtMs);
@@ -264,68 +228,62 @@ GestureEvent GestureFSM::handleFrame(const HandKeypoints& kpRaw, double dtMs) {
                     m_state = CtrlState::kIdle;
                     m_holdMs = 0;
                     m_cooldownMs = m_cfg.stateCooldownMs;
-                    // 若此前在按下/拖拽，先强制结束（防止左键卡死）
-                    m_pressActive = false;
-                    m_pressHoldMs = 0;
+                    m_pinching = false;
+                    m_pinchHoldMs = 0;
                     m_dragging = false;
                     event = GestureEvent::kOpenPalmHold;
                     std::printf("[FSM] 状态迁移：LOCKED → IDLE（已解锁）\n");
                 }
-                // 开掌期间不响应定位/点击（锁定/解锁手势生效中）
-                break;
+                break;  // 开掌期间不响应定位/点击
             }
 
-            // ---- 非开掌（单指/其他状态）：单指控制 ----
+            // ---- 非开掌：捏合控制 ----
             // 记录平滑后食指尖（点8）坐标供上层绝对定位
             m_smoothTipX = kp.points[8].x;
             m_smoothTipY = kp.points[8].y;
 
-            // 食指尖 y 方向运动速度（图像 y 向下：下点为正）
-            float velY = 0.f;
-            if (m_lastIndexTipY >= 0) {
-                velY = (m_smoothTipY - m_lastIndexTipY) * 1000.f / static_cast<float>(dtMs);
-            }
-            m_lastIndexTipX = m_smoothTipX;
-            m_lastIndexTipY = m_smoothTipY;
+            // 捏合距离 = 拇指尖(4)与食指尖(8)的欧式距离
+            float pinchDist = distance(kp.points[4].x, kp.points[4].y,
+                                       kp.points[8].x, kp.points[8].y);
+            bool pinched = (pinchDist < m_cfg.pinchDistThresholdPx);
 
-            if (!m_pressActive && !m_dragging) {
-                // ---- 空闲：检测下压（食指尖快速下点）----
-                if (velY > m_cfg.clickPressSpeedPx) {
-                    m_pressActive = true;
-                    m_pressHoldMs = 0;
-                    std::printf("[FSM] 按下开始（下压速度=%.0fpx/s）\n", velY);
+            if (!m_pinching && !m_dragging) {
+                // ---- 空闲：检测捏合（点击/拖拽的开始动作）----
+                if (pinched) {
+                    m_pinching = true;
+                    m_pinchHoldMs = 0;
+                    std::printf("[FSM] 捏合开始（距离=%.0fpx）\n", pinchDist);
                 } else {
-                    // 无操作：上报绝对定位移动
-                    event = GestureEvent::kPointerMove;
+                    event = GestureEvent::kPointerMove;  // 未捏合：绝对定位移动
                 }
             } else if (m_dragging) {
-                // ---- 拖拽中：检测抬起结束 ----
-                if (velY < -m_cfg.clickPressSpeedPx * 0.5f) {
+                // ---- 拖拽中：检测松开结束 ----
+                if (!pinched) {
                     m_dragging = false;
-                    m_pressActive = false;
-                    m_pressHoldMs = 0;
+                    m_pinching = false;
+                    m_pinchHoldMs = 0;
                     event = GestureEvent::kDragEnd;
-                    std::printf("[FSM] 拖拽结束（指尖抬起）\n");
+                    std::printf("[FSM] 拖拽结束（松开捏合）\n");
                 } else {
                     event = GestureEvent::kDragMove;  // 拖拽移动：跟手
                 }
             } else {
-                // ---- 按下判定中：区分单击与拖拽 ----
-                m_pressHoldMs += static_cast<int>(dtMs);
-                if (velY < -m_cfg.clickPressSpeedPx * 0.5f && m_pressHoldMs < m_cfg.clickPressTimeMs) {
-                    // 快速回弹且未超时：单击
-                    m_pressActive = false;
-                    m_pressHoldMs = 0;
+                // ---- 捏合判定中：区分单击与拖拽 ----
+                m_pinchHoldMs += static_cast<int>(dtMs);
+                if (!pinched) {
+                    // 松开且未达拖拽阈值：单击
+                    m_pinching = false;
+                    m_pinchHoldMs = 0;
                     event = GestureEvent::kClick;
-                    std::printf("[FSM] 单击\n");
-                } else if (m_pressHoldMs >= m_cfg.clickPressTimeMs) {
-                    // 按住超时：进入拖拽
+                    std::printf("[FSM] 单击（捏合 %dms）\n", m_pinchHoldMs);
+                } else if (m_pinchHoldMs >= m_cfg.pinchHoldMs) {
+                    // 捏合保持超时：进入拖拽
                     m_dragging = true;
-                    m_pressActive = false;
+                    m_pinching = false;
                     event = GestureEvent::kDragStart;
-                    std::printf("[FSM] 拖拽开始（按住 %dms）\n", m_pressHoldMs);
+                    std::printf("[FSM] 拖拽开始（捏合 %dms）\n", m_pinchHoldMs);
                 }
-                // 其余情况：按下中尚未定性，保持等待（不发移动，避免点击时鼠标抖动）
+                // 其余情况：捏合中尚未定性，等待（不发移动，避免误动）
             }
             break;
     }

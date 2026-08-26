@@ -1,30 +1,35 @@
 #pragma once
 // ============================================================================
 // gesture_fsm/gesture_fsm.h
-// 作用：手势有限状态机（v2 单指控制方案核心模块）。
+// 作用：手势有限状态机（v2.1 捏合控制方案核心模块）。
 //
-// v2 交互模型（方案A：单指绝对定位）：
+// v2.1 交互模型（点击/移动完全正交，杜绝误判）：
 //   IDLE       空闲态：唯一手势 = 开掌长按锁定
 //     └─开掌持续≥lock_hold_ms──→ LOCKED
 //   LOCKED     锁定运行态：
 //     ├─ 开掌长按≥lock_hold_ms──→ IDLE（解锁）
-//     ├─ 非开掌（食指伸出）──→ 每帧上报 kPointerMove（食指尖绝对定位鼠标）
-//     ├─ 食指尖快速下压 ──→ 按下判定
-//     │    ├─ 在 press_time_ms 内回弹 ──→ kClick（单击）
-//     │    └─ 按住超过 press_time_ms ──→ kDragStart（拖拽开始）
-//     ├─ 拖拽中移动 ──→ kDragMove（食指尖跟手移动）
-//     └─ 拖拽中指尖抬起 ──→ kDragEnd（拖拽结束）
+//     ├─ 拇指食指张开（未捏合）──→ 每帧 kPointerMove（食指尖绝对定位鼠标）
+//     ├─ 快速捏合→松开 ──→ kClick（左键单击）
+//     ├─ 捏合保持 ≥pinch_hold_ms ──→ kDragStart（拖拽开始，左键按住）
+//     ├─ 拖拽中移动 ──→ kDragMove（左键保持 + 跟手）
+//     └─ 松开捏合 ──→ kDragEnd（拖拽结束，释放左键）
+//
+// 为何用"捏合"而不是"下点"（v2.0 方案的问题）：
+//   1. v2.0 用食指尖 y 方向速度判定"下点"，与移动天然冲突——
+//      手指移动时本身就有 y 分量，极易误触发点击/拖拽。
+//   2. 捏合判定用"拇指尖(4)与食指尖(8)的距离"，与手平移完全正交：
+//      平移时捏合状态不变，移动永不误触发点击。
+//   3. 捏合距离对"手指朝屏幕"的投影缩短鲁棒（两指尖相对位置不变）。
 //
 // 事件输出：
 //   kOpenPalmHold 开掌长按锁定/解锁开关（无 uinput 输出，仅状态切换）
-//   kPointerMove  鼠标绝对定位移动（上层用食指尖坐标映射屏幕）
+//   kPointerMove  食指尖绝对定位移动（上层映射屏幕坐标）
 //   kClick        左键单击
 //   kDragStart    拖拽开始（左键按住）
 //   kDragMove     拖拽移动（左键保持 + 跟手）
 //   kDragEnd      拖拽结束（左键释放）
 //
-// 判定阈值全部来自 config/gesture_config.json（click.press_speed_px 等），
-// 代码中禁止硬编码魔法数字。
+// 全部阈值来自 config/gesture_config.json，代码中禁止硬编码魔法数字。
 //
 // MediaPipe Hands 21 关键点索引参考：
 //   0: WRIST（手腕）
@@ -47,15 +52,15 @@ enum class CtrlState {
     kLocked = 1,   // 锁定运行：响应单指控制（定位/点击/拖拽）
 };
 
-// 手势事件枚举：状态机对外输出的识别结果（v2 单指方案）
+// 手势事件枚举：状态机对外输出的识别结果（v2.1 捏合方案）
 enum class GestureEvent {
-    kNone        = 0,   // 无动作
-    kOpenPalmHold = 1,  // 开掌长按：锁定/解锁开关（≥lock_hold_ms）
-    kPointerMove = 2,   // 食指定位移动（LOCKED 态每帧上报，供绝对定位）
-    kClick       = 3,   // 食指快速下点+回弹：左键单击
-    kDragStart   = 4,   // 食指下点按住（超 press_time_ms）：拖拽开始
-    kDragMove    = 5,   // 拖拽中移动（左键保持按下）
-    kDragEnd     = 6,   // 指尖抬起：拖拽结束（释放左键）
+    kNone         = 0,   // 无动作
+    kOpenPalmHold = 1,   // 开掌长按：锁定/解锁开关（≥lock_hold_ms）
+    kPointerMove  = 2,   // 食指尖定位移动（LOCKED 态未捏合时每帧上报）
+    kClick        = 3,   // 快速捏合→松开：左键单击
+    kDragStart    = 4,   // 捏合保持（超 pinch_hold_ms）：拖拽开始
+    kDragMove     = 5,   // 拖拽中移动（左键保持按下）
+    kDragEnd      = 6,   // 松开捏合：拖拽结束（释放左键）
 };
 
 // JSON 配置参数集合（运行时加载，所有阈值外置）
@@ -63,7 +68,7 @@ struct FsmConfig {
     // 锁定相关
     int   lockHoldMs = 1200;            // 开掌长按锁定/解锁时长阈值（毫秒）
     int   stateCooldownMs = 1500;       // 状态切换防抖冷却时间（毫秒）：锁定/解锁切换后
-                                        // 此时间内不允许再次切换，防止脸部误判导致状态疯狂跳动
+                                        // 此时间内不允许再次切换，防止误判导致状态疯狂跳动
 
     // 卡尔曼滤波
     float kalmanProcessNoise = 1.0f;    // 过程噪声
@@ -72,15 +77,14 @@ struct FsmConfig {
     // 开掌判定（锁定/解锁手势）
     float openPalmRatio = 1.8f;         // 手指伸直比值阈值：每指指尖到手腕/该指根(MCP)到手腕 > 此值
                                         // 视为该手指伸直。5 指全部伸直 = 开掌。
-                                        // 比值法对"手指朝屏幕"投影缩短鲁棒
+                                        // 拇指阈值自动放宽（×0.8），因其根紧邻手腕比值天然小
 
-    // 点击/拖拽判定（v2 核心）
-    float clickPressSpeedPx = 60.f;     // 下压速度阈值（像素/秒）：食指尖 y 方向下落速度超此值判定"按下"
-    int   clickPressTimeMs  = 250;      // 按下后回弹最大时长（毫秒）：在此时长内抬起 = 单击
-    int   clickReleaseTimeMs = 250;     // 预留：回弹判定时长（当前与 press 共用）
+    // 捏合判定（点击/拖拽动作，v2.1 核心）
+    float pinchDistThresholdPx = 40.f;  // 捏合距离阈值（像素）：拇指尖(4)与食指尖(8)距离 < 此值 = 捏合
+    int   pinchHoldMs = 350;            // 捏合保持时长阈值（毫秒）：保持超过 = 拖拽开始；之前松开 = 单击
 
     // 鼠标绝对定位灵敏度
-    float mouseSensitivity = 2.0f;      // 目标位移 × 系数 = 实际注入位移（>1 更灵敏）
+    float mouseSensitivity = 1.5f;      // 目标位移 × 系数 = 实际注入位移（>1 更灵敏）
 
     // 图像尺寸（用于坐标映射比例计算）
     int   imageWidth  = 640;
@@ -97,21 +101,15 @@ public:
     ~GestureFSM();
 
     // 加载 JSON 配置文件
-    // @param configPath gesture_config.json 路径
-    // @return true 加载成功，false 失败（内部输出中文错误日志）
     bool loadConfig(const std::string& configPath);
 
-    // 配置热加载：检测配置文件 mtime 是否变化，变化则自动重新加载全部阈值
-    // @return true 本次发生了重载（配置有变更），false 无变更
+    // 配置热加载：检测配置文件 mtime 变化，变化则自动重新加载
     bool reloadIfChanged();
 
     // 处理一帧关键点数据，驱动状态机推进
-    // @param kp   当前帧的 21 个手部关键点（已由上层完成推理）
-    // @param dtMs 与上一帧的时间间隔（毫秒），用于时长/速度类手势判定
-    // @return 当前帧识别到的手势事件
     GestureEvent handleFrame(const HandKeypoints& kp, double dtMs);
 
-    // 对 21 个关键点做卡尔曼平滑（在 handleFrame 内部调用，也可独立调用）
+    // 对 21 个关键点做卡尔曼平滑（handleFrame 内部调用）
     void smoothKeypoints(const HandKeypoints& in, HandKeypoints& out);
 
     // 查询当前状态机所处状态（调试/日志打印用）
@@ -121,7 +119,6 @@ public:
     CtrlState currentState() const { return m_state; }
 
     // 获取平滑后的食指尖（点8）坐标，供上层做鼠标绝对定位
-    // @return 平滑后食指尖坐标；若未初始化返回 (-1,-1)
     void lastIndexTip(float& x, float& y) const;
 
     // 获取屏幕分辨率（绝对定位映射目标）
@@ -132,7 +129,7 @@ public:
     int imageWidth() const  { return m_cfg.imageWidth; }
     int imageHeight() const { return m_cfg.imageHeight; }
 
-    // 获取鼠标定位灵敏度系数（供上层将目标位移放大后注入）
+    // 获取鼠标定位灵敏度系数
     float mouseSensitivity() const { return m_cfg.mouseSensitivity; }
 
 private:
@@ -141,12 +138,10 @@ private:
     int       m_holdMs = 0;                 // 开掌（锁定手势）持续累计时长（毫秒）
     int       m_cooldownMs = 0;             // 状态切换防抖冷却计时器（毫秒）
 
-    // 点击/拖拽检测状态（v2 核心）
-    bool  m_pressActive = false;            // 是否处于"按下"判定中
-    int   m_pressHoldMs = 0;                // 按下持续累计时长（毫秒）
+    // 捏合/拖拽检测状态（v2.1 核心）
+    bool  m_pinching = false;               // 是否处于捏合中（等待区分单击/拖拽）
+    int   m_pinchHoldMs = 0;                // 捏合持续累计时长（毫秒）
     bool  m_dragging = false;               // 是否正在拖拽（左键按住中）
-    float m_lastIndexTipX = -1.f;           // 上一帧食指尖 X（用于移动判定）
-    float m_lastIndexTipY = -1.f;           // 上一帧食指尖 Y（用于下压速度判定）
     float m_smoothTipX = -1.f;              // 平滑后食指尖 X（供上层绝对定位）
     float m_smoothTipY = -1.f;              // 平滑后食指尖 Y
 
@@ -157,10 +152,10 @@ private:
     FsmConfig m_cfg;
     bool      m_cfgLoaded = false;
     std::string m_configPath;               // 当前配置文件路径（热加载检测用）
-    long      m_configMtime = 0;            // 配置文件的最后修改时间（mtime，热加载检测用）
+    long      m_configMtime = 0;            // 配置文件 mtime（热加载检测用）
 
     // --------------------------- 手势判定函数 ---------------------------
-    // 开掌判定：5 根手指全部伸直（指尖到手腕 / 指根到手腕 > openPalmRatio）
+    // 开掌判定：5 根手指全部伸直（指尖到手腕 / 指根到手腕 > openPalmRatio，拇指 ×0.8）
     bool detectOpenPalm(const HandKeypoints& kp);
 
     // 工具：计算两点欧式距离

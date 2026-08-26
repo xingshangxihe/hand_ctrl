@@ -35,7 +35,7 @@ static const char* eventToString(GestureEvent e) {
         case GestureEvent::kNone:        return "无";
         case GestureEvent::kOpenPalmHold: return "开掌长按(锁定/解锁)";
         case GestureEvent::kPointerMove: return "食指定位移动";
-        case GestureEvent::kClick:       return "食指点击(左键)";
+        case GestureEvent::kClick:       return "捏合点击(左键)";
         case GestureEvent::kDragStart:   return "拖拽开始";
         case GestureEvent::kDragMove:    return "拖拽移动";
         case GestureEvent::kDragEnd:     return "拖拽结束";

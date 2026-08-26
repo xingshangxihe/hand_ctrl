@@ -7,9 +7,10 @@
 //   推理线程:   从帧队列取帧 → ONNXInfer::infer → 关键点队列
 //   主线程  :   从关键点队列取 → GestureFSM::handleFrame → UInputManager 输出
 //
-// v2 交互模型（方案A：单指绝对定位）：
-//   锁定后食指指尖 = 鼠标指针（画面坐标等比映射屏幕坐标）
-//   快速下点 = 单击；下点按住 = 拖拽；开掌1.2s = 锁定/解锁
+// v2.1 交互模型（捏合控制）：
+//   开掌1.2s = 锁定/解锁
+//   锁定后：拇指食指张开 → 食指尖绝对定位鼠标
+//   快速捏合→松开 = 单击；捏合保持 = 拖拽（移动跟手，松开释放）
 //
 // 绝对定位实现要点：
 //   uinput 是相对位移设备，需软件维护"虚拟鼠标位置"：
@@ -34,6 +35,7 @@
 #include <chrono>
 #include <atomic>
 #include <cstdint>
+#include <algorithm>
 #include <opencv2/opencv.hpp>
 
 #include "utils/common.h"
@@ -487,9 +489,16 @@ int main(int argc, char* argv[]) {
                     moveAccumX -= dx;
                     moveAccumY -= dy;
                     if (dx != 0 || dy != 0) {
-                        uinput.moveMouse(dx, dy);
-                        virtualMouseX += dx;
-                        virtualMouseY += dy;
+                        // 限制虚拟位置不越出屏幕边界（防止指针飞出导致窗口异常）
+                        float nx = virtualMouseX + dx;
+                        float ny = virtualMouseY + dy;
+                        dx = static_cast<int>(std::max(0.f, std::min(static_cast<float>(scrW), nx)) - virtualMouseX);
+                        dy = static_cast<int>(std::max(0.f, std::min(static_cast<float>(scrH), ny)) - virtualMouseY);
+                        if (dx != 0 || dy != 0) {
+                            uinput.moveMouse(dx, dy);
+                            virtualMouseX += dx;
+                            virtualMouseY += dy;
+                        }
                     }
                 }
                 break;
@@ -543,7 +552,7 @@ static const char* eventToString(GestureEvent e) {
         case GestureEvent::kNone:        return "无";
         case GestureEvent::kOpenPalmHold: return "开掌长按(锁定/解锁)";
         case GestureEvent::kPointerMove: return "食指定位移动";
-        case GestureEvent::kClick:       return "食指点击(左键)";
+        case GestureEvent::kClick:       return "捏合点击(左键)";
         case GestureEvent::kDragStart:   return "拖拽开始";
         case GestureEvent::kDragMove:    return "拖拽移动";
         case GestureEvent::kDragEnd:     return "拖拽结束";
