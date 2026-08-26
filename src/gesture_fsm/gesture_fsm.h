@@ -8,7 +8,7 @@
 //     └─开掌持续≥lock_hold_ms──→ LOCKED
 //   LOCKED     锁定运行态：
 //     ├─ 开掌长按≥lock_hold_ms──→ IDLE（解锁）
-//     ├─ 非握拳（食指伸出）──→ 每帧上报 kPointerMove（食指尖绝对定位鼠标）
+//     ├─ 非开掌（食指伸出）──→ 每帧上报 kPointerMove（食指尖绝对定位鼠标）
 //     ├─ 食指尖快速下压 ──→ 按下判定
 //     │    ├─ 在 press_time_ms 内回弹 ──→ kClick（单击）
 //     │    └─ 按住超过 press_time_ms ──→ kDragStart（拖拽开始）
@@ -43,7 +43,7 @@ namespace hand_ctrl {
 
 // 状态枚举（强类型，避免魔法数字）
 enum class CtrlState {
-    kIdle   = 0,   // 空闲：等待握拳长按触发锁定
+    kIdle   = 0,   // 空闲：等待开掌长按触发锁定
     kLocked = 1,   // 锁定运行：响应单指控制（定位/点击/拖拽）
 };
 
@@ -61,7 +61,7 @@ enum class GestureEvent {
 // JSON 配置参数集合（运行时加载，所有阈值外置）
 struct FsmConfig {
     // 锁定相关
-    int   lockHoldMs = 1200;            // 握拳长按锁定/解锁时长阈值（毫秒）
+    int   lockHoldMs = 1200;            // 开掌长按锁定/解锁时长阈值（毫秒）
     int   stateCooldownMs = 1500;       // 状态切换防抖冷却时间（毫秒）：锁定/解锁切换后
                                         // 此时间内不允许再次切换，防止脸部误判导致状态疯狂跳动
 
@@ -138,7 +138,7 @@ public:
 private:
     // --------------------------- 状态成员 ---------------------------
     CtrlState m_state = CtrlState::kIdle;   // 当前状态
-    int       m_fistHoldMs = 0;             // 握拳持续累计时长（毫秒）
+    int       m_holdMs = 0;                 // 开掌（锁定手势）持续累计时长（毫秒）
     int       m_cooldownMs = 0;             // 状态切换防抖冷却计时器（毫秒）
 
     // 点击/拖拽检测状态（v2 核心）

@@ -9,7 +9,7 @@
 //
 // v2 交互模型（方案A：单指绝对定位）：
 //   锁定后食指指尖 = 鼠标指针（画面坐标等比映射屏幕坐标）
-//   快速下点 = 单击；下点按住 = 拖拽；握拳1.2s = 锁定/解锁
+//   快速下点 = 单击；下点按住 = 拖拽；开掌1.2s = 锁定/解锁
 //
 // 绝对定位实现要点：
 //   uinput 是相对位移设备，需软件维护"虚拟鼠标位置"：
@@ -340,7 +340,7 @@ int main(int argc, char* argv[]) {
                     }
                 }
                 // 注意：OpenCV putText 只支持 ASCII（Hershey 矢量字体），中文会乱码，故用英文
-                std::string stateText = std::string("State: ") + fsm.currentStateName() + "  (fist 1.2s to lock)";
+                std::string stateText = std::string("State: ") + fsm.currentStateName() + "  (open palm 1.2s to lock)";
                 cv::putText(vis, stateText, cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 255), 2);
                 // 窗口创建：只在首次调用 namedWindow（WINDOW_NORMAL 允许调整大小）。
                 // 关键修复：若每次循环都调用 namedWindow，用户点 × 关闭窗口后，

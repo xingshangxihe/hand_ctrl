@@ -151,22 +151,28 @@ float GestureFSM::distance(float x1, float y1, float x2, float y2) {
 //       - 开掌 = 5 根手指全部伸直（各指尖到手腕距离 / 各指根 MCP 到手腕距离 > 阈值）
 //       - 单指控制 = 仅食指伸直，其余弯曲 → 不满足"全部伸直" → 不会误触锁定/解锁
 // 比值法对"手指朝屏幕"的透视投影等比缩短鲁棒（分子分母同缩，比值不变）。
+//
+// 注意（拇指特殊性）：拇指根(2)紧邻手腕，开掌时"拇指尖/拇指根"比值天然小于
+//       其余四指（其余四指根在手掌中部，手腕距指根本就有一定长度）。
+//       故拇指使用放宽阈值（openPalmRatio × 0.8），其余四指用标准阈值。
 bool GestureFSM::detectOpenPalm(const HandKeypoints& kp) {
     if (kp.points.size() < 21) return false;
     const auto& w = kp.points[0];  // 手腕
-    // 5 根手指的 [指尖, 指根 MCP] 索引对：
+    // 5 根手指的 [指尖, 指根 MCP] 索引对 + 是否拇指：
     //   拇指(2=MCP, 4=TIP)、食指(5,8)、中指(9,12)、无名指(13,16)、小指(17,20)
     const int tipBase[][2] = {
         {4, 2}, {8, 5}, {12, 9}, {16, 13}, {20, 17}
     };
 
-    for (auto& tb : tipBase) {
-        int tip = tb[0], base = tb[1];
+    for (int i = 0; i < 5; ++i) {
+        int tip = tipBase[i][0], base = tipBase[i][1];
         float tipToWrist = distance(kp.points[tip].x, kp.points[tip].y, w.x, w.y);
         float baseToWrist = distance(kp.points[base].x, kp.points[base].y, w.x, w.y);
         if (baseToWrist < 1e-6f) return false;  // 指根异常（退化保护）
-        // 手指未伸直（弯曲）：指尖与指根接近，比值小 → 非开掌
-        if (tipToWrist / baseToWrist < m_cfg.openPalmRatio) return false;
+        // 拇指阈值放宽（×0.8），其余四指用标准阈值
+        float ratio = tipToWrist / baseToWrist;
+        float threshold = (i == 0) ? (m_cfg.openPalmRatio * 0.8f) : m_cfg.openPalmRatio;
+        if (ratio < threshold) return false;  // 该指未伸直 → 非开掌
     }
     return true;  // 5 指全部伸直 = 开掌
 }
@@ -190,7 +196,7 @@ GestureEvent GestureFSM::handleFrame(const HandKeypoints& kpRaw, double dtMs) {
     // 2. 手不存在或置信度过低：重置全部状态，若拖拽中先强制结束
     bool lowConfidence = (kpRaw.confidence < 0.5f);
     if (!kp.valid || kp.points.size() < kHandKeypointCount || lowConfidence) {
-        m_fistHoldMs = 0;
+        m_holdMs = 0;
         GestureEvent lostEvent = GestureEvent::kNone;
         if (m_dragging || m_pressActive) {
             m_dragging = false;
@@ -216,19 +222,36 @@ GestureEvent GestureFSM::handleFrame(const HandKeypoints& kpRaw, double dtMs) {
     GestureEvent event = GestureEvent::kNone;
     switch (m_state) {
         case CtrlState::kIdle:
+            // 诊断日志：每 60 帧打印各手指"指尖/指根"比值（帮助调开掌阈值）
+            // 拇指阈值 = openPalmRatio×0.8，其余四指 = openPalmRatio
+            {
+                static int diagCnt = 0;
+                if (++diagCnt % 60 == 1) {
+                    const float f_th = m_cfg.openPalmRatio;
+                    float r[5];
+                    const int tb[][2] = {{4,2},{8,5},{12,9},{16,13},{20,17}};
+                    for (int i = 0; i < 5; ++i) {
+                        float a = distance(kp.points[tb[i][0]].x, kp.points[tb[i][0]].y, kp.points[0].x, kp.points[0].y);
+                        float b = distance(kp.points[tb[i][1]].x, kp.points[tb[i][1]].y, kp.points[0].x, kp.points[0].y);
+                        r[i] = (b > 1e-6f) ? a / b : 0.f;
+                    }
+                    std::printf("[FSM] 开掌诊断 拇/食/中/无/小 = %.2f/%.2f/%.2f/%.2f/%.2f (阈值 %.2f/%.2f)\n",
+                                r[0], r[1], r[2], r[3], r[4], f_th * 0.8f, f_th);
+                }
+            }
             // IDLE 态：开掌长按触发锁定
             if (detectOpenPalm(kp)) {
-                m_fistHoldMs += static_cast<int>(dtMs);
-                if (m_fistHoldMs >= m_cfg.lockHoldMs && m_cooldownMs <= 0) {
+                m_holdMs += static_cast<int>(dtMs);
+                if (m_holdMs >= m_cfg.lockHoldMs && m_cooldownMs <= 0) {
                     m_state = CtrlState::kLocked;
-                    m_fistHoldMs = 0;
+                    m_holdMs = 0;
                     m_cooldownMs = m_cfg.stateCooldownMs;
                     event = GestureEvent::kOpenPalmHold;
                     std::printf("[FSM] 状态迁移：IDLE → LOCKED（已锁定）\n");
                 }
             } else {
                 // 衰减容忍：短暂变化（帧间抖动）只衰减 30ms 不清零
-                m_fistHoldMs = (m_fistHoldMs > 30) ? (m_fistHoldMs - 30) : 0;
+                m_holdMs = (m_holdMs > 30) ? (m_holdMs - 30) : 0;
             }
             break;
 
@@ -236,10 +259,10 @@ GestureEvent GestureFSM::handleFrame(const HandKeypoints& kpRaw, double dtMs) {
             // LOCKED 态：开掌解锁 / 单指控制（定位/点击/拖拽）
             if (detectOpenPalm(kp)) {
                 // ---- 开掌：累计长按解锁 ----
-                m_fistHoldMs += static_cast<int>(dtMs);
-                if (m_fistHoldMs >= m_cfg.lockHoldMs && m_cooldownMs <= 0) {
+                m_holdMs += static_cast<int>(dtMs);
+                if (m_holdMs >= m_cfg.lockHoldMs && m_cooldownMs <= 0) {
                     m_state = CtrlState::kIdle;
-                    m_fistHoldMs = 0;
+                    m_holdMs = 0;
                     m_cooldownMs = m_cfg.stateCooldownMs;
                     // 若此前在按下/拖拽，先强制结束（防止左键卡死）
                     m_pressActive = false;
