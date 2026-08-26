@@ -33,7 +33,7 @@ static void onSignal(int) { g_shouldExit = 1; }
 static const char* eventToString(GestureEvent e) {
     switch (e) {
         case GestureEvent::kNone:        return "无";
-        case GestureEvent::kFistHold:    return "握拳长按(锁定/解锁)";
+        case GestureEvent::kOpenPalmHold: return "开掌长按(锁定/解锁)";
         case GestureEvent::kPointerMove: return "食指定位移动";
         case GestureEvent::kClick:       return "食指点击(左键)";
         case GestureEvent::kDragStart:   return "拖拽开始";
@@ -176,7 +176,7 @@ int main(int argc, char* argv[]) {
     camera.release();
     cv::destroyAllWindows();
     std::printf("[fsm_test] 结束。共 %d 帧，事件统计:\n", frameCnt);
-    for (int i = 1; i <= 6; ++i) {  // kFistHold(1) ~ kDragEnd(6)
+    for (int i = 1; i <= 6; ++i) {  // kOpenPalmHold(1) ~ kDragEnd(6)
         std::printf("  %-20s: %d 次\n", eventToString(static_cast<GestureEvent>(i)), eventCnt[i]);
     }
     return 0;

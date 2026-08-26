@@ -26,10 +26,9 @@
     "_说明": "卡尔曼滤波参数：process_noise 越大越信任测量值（响应快但抖），measure_noise 越大越信任预测值（平滑但延迟）"
   },
 
-  "fist": {
-    "distance_threshold_px": 160,
-    "index_extension_ratio": 1.8,
-    "_说明": "判定握拳：①所有指尖到手腕距离均小于 distance_threshold_px；②食指必须弯曲——食指指尖(8)到手腕距离 / 食指根(5)到手腕距离 必须小于 index_extension_ratio（比值法对'手指朝屏幕'的投影缩短鲁棒，避免伸食指控制时被误判为握拳）"
+  "open_palm": {
+    "extension_ratio": 1.8,
+    "_说明": "锁定/解锁手势改为「五指张开（开掌）」。判定：5 根手指均伸直——每根手指指尖到手腕距离 / 该指根(MCP)到手腕距离 > extension_ratio。比值法对'手指朝屏幕'的投影缩短鲁棒。单指控制时仅食指伸直、其余弯曲，不满足全部伸直 → 不会误触"
   },
 
   "click": {

@@ -451,7 +451,7 @@ int main(int argc, char* argv[]) {
 
         // 事件映射到 uinput 输出（v2 单指方案）
         switch (e) {
-            case GestureEvent::kFistHold:
+            case GestureEvent::kOpenPalmHold:
                 // 锁定/解锁切换：无 uinput 输出（仅状态切换）
                 std::printf("[main] 状态切换: %s\n", fsm.currentStateName());
                 // 安全释放左键：若此前在拖拽/按下中，必须释放避免鼠标卡住
@@ -541,7 +541,7 @@ int main(int argc, char* argv[]) {
 static const char* eventToString(GestureEvent e) {
     switch (e) {
         case GestureEvent::kNone:        return "无";
-        case GestureEvent::kFistHold:    return "握拳长按(锁定/解锁)";
+        case GestureEvent::kOpenPalmHold: return "开掌长按(锁定/解锁)";
         case GestureEvent::kPointerMove: return "食指定位移动";
         case GestureEvent::kClick:       return "食指点击(左键)";
         case GestureEvent::kDragStart:   return "拖拽开始";

@@ -4,10 +4,10 @@
 // 作用：手势有限状态机（v2 单指控制方案核心模块）。
 //
 // v2 交互模型（方案A：单指绝对定位）：
-//   IDLE       空闲态：唯一手势 = 握拳长按锁定
-//     └─握拳持续≥lock_hold_ms──→ LOCKED
+//   IDLE       空闲态：唯一手势 = 开掌长按锁定
+//     └─开掌持续≥lock_hold_ms──→ LOCKED
 //   LOCKED     锁定运行态：
-//     ├─ 握拳长按≥lock_hold_ms──→ IDLE（解锁）
+//     ├─ 开掌长按≥lock_hold_ms──→ IDLE（解锁）
 //     ├─ 非握拳（食指伸出）──→ 每帧上报 kPointerMove（食指尖绝对定位鼠标）
 //     ├─ 食指尖快速下压 ──→ 按下判定
 //     │    ├─ 在 press_time_ms 内回弹 ──→ kClick（单击）
@@ -16,7 +16,7 @@
 //     └─ 拖拽中指尖抬起 ──→ kDragEnd（拖拽结束）
 //
 // 事件输出：
-//   kFistHold     锁定/解锁开关（无 uinput 输出，仅状态切换）
+//   kOpenPalmHold 开掌长按锁定/解锁开关（无 uinput 输出，仅状态切换）
 //   kPointerMove  鼠标绝对定位移动（上层用食指尖坐标映射屏幕）
 //   kClick        左键单击
 //   kDragStart    拖拽开始（左键按住）
@@ -50,7 +50,7 @@ enum class CtrlState {
 // 手势事件枚举：状态机对外输出的识别结果（v2 单指方案）
 enum class GestureEvent {
     kNone        = 0,   // 无动作
-    kFistHold    = 1,   // 握拳长按：锁定/解锁开关（≥lock_hold_ms）
+    kOpenPalmHold = 1,  // 开掌长按：锁定/解锁开关（≥lock_hold_ms）
     kPointerMove = 2,   // 食指定位移动（LOCKED 态每帧上报，供绝对定位）
     kClick       = 3,   // 食指快速下点+回弹：左键单击
     kDragStart   = 4,   // 食指下点按住（超 press_time_ms）：拖拽开始
@@ -69,10 +69,10 @@ struct FsmConfig {
     float kalmanProcessNoise = 1.0f;    // 过程噪声
     float kalmanMeasureNoise = 4.0f;    // 测量噪声
 
-    // 握拳判定
-    int   fistDistThreshold = 160;      // 握拳距离阈值（像素）：所有指尖到手腕距离均小于此值
-    float indexExtensionRatio = 1.8f;   // 食指伸直比值阈值：食指尖到手腕/食指根到手腕 > 此值
-                                        // 视为食指伸直（非握拳）。比值法对"手指朝屏幕"投影缩短鲁棒
+    // 开掌判定（锁定/解锁手势）
+    float openPalmRatio = 1.8f;         // 手指伸直比值阈值：每指指尖到手腕/该指根(MCP)到手腕 > 此值
+                                        // 视为该手指伸直。5 指全部伸直 = 开掌。
+                                        // 比值法对"手指朝屏幕"投影缩短鲁棒
 
     // 点击/拖拽判定（v2 核心）
     float clickPressSpeedPx = 60.f;     // 下压速度阈值（像素/秒）：食指尖 y 方向下落速度超此值判定"按下"
@@ -160,8 +160,8 @@ private:
     long      m_configMtime = 0;            // 配置文件的最后修改时间（mtime，热加载检测用）
 
     // --------------------------- 手势判定函数 ---------------------------
-    // 握拳判定：所有指尖(4,8,12,16,20)到手腕(0)距离均 < fistDistThreshold
-    bool detectFistHold(const HandKeypoints& kp);
+    // 开掌判定：5 根手指全部伸直（指尖到手腕 / 指根到手腕 > openPalmRatio）
+    bool detectOpenPalm(const HandKeypoints& kp);
 
     // 工具：计算两点欧式距离
     static float distance(float x1, float y1, float x2, float y2);
