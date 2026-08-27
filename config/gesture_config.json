@@ -15,15 +15,15 @@
   },
 
   "lock": {
-    "hold_time_ms": 1200,
+    "hold_time_ms": 1000,
     "state_cooldown_ms": 1500,
-    "_说明": "开掌长按锁定/解锁阈值（毫秒）；state_cooldown_ms 为状态切换防抖冷却时间（毫秒）"
+    "_说明": "开掌长按锁定/解锁阈值（毫秒）——调低至 1.0s 让锁定/解锁响应更快；state_cooldown_ms 为状态切换防抖冷却时间（毫秒）"
   },
 
   "kalman": {
     "process_noise": 1.0,
-    "measure_noise": 4.0,
-    "_说明": "卡尔曼滤波参数：process_noise 越大越信任测量值（响应快但抖），measure_noise 越大越信任预测值（平滑但延迟）"
+    "measure_noise": 8.0,
+    "_说明": "卡尔曼滤波参数：process_noise 越大越信任测量值（响应快但抖），measure_noise 越大越信任预测值（平滑但延迟）。measure_noise 从 4.0 提至 8.0 加强平滑，抑制移动抖动"
   },
 
   "open_palm": {

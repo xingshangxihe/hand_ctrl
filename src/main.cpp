@@ -187,6 +187,9 @@ int main(int argc, char* argv[]) {
         int failCnt = 0;
         while (!g_shouldExit.load()) {
             if (camera.readFrame(frame)) {
+                // 水平翻转（镜像）：摄像头是"被看视角"，不翻转时手往左走画面里手往右，
+                // 鼠标方向与直觉相反。翻转后画面如照镜子，手往左画面往左 → 鼠标往左。
+                cv::flip(frame, frame, 1);
                 frameQueue.push(frame.clone());  // clone 避免 Camera 缓冲被覆盖
                 // 更新共享最新帧（供主线程可视化）
                 {
@@ -495,12 +498,12 @@ int main(int argc, char* argv[]) {
                     // ---- 位移 EMA 低通滤波（直线修正）----
                     // 手部抖动是高频噪声，直接注入会让鼠标路径"蛇形"。
                     // 用指数滑动平均：sm = α×本次 + (1-α)×上次，抑制高频抖动。
-                    // α 越小越平滑（路径直）但响应稍慢，取 0.45 兼顾。
-                    const float kEmaAlpha = 0.45f;
+                    // α 越小越平滑（路径直）但响应稍慢，取 0.35 偏平滑。
+                    const float kEmaAlpha = 0.35f;
                     smMoveX = kEmaAlpha * wantDx + (1.f - kEmaAlpha) * smMoveX;
                     smMoveY = kEmaAlpha * wantDy + (1.f - kEmaAlpha) * smMoveY;
                     // 死区：平滑后位移过小则忽略（手微抖/停留时不产生漂移）
-                    if (std::fabs(smMoveX) < 0.4f && std::fabs(smMoveY) < 0.4f) {
+                    if (std::fabs(smMoveX) < 0.8f && std::fabs(smMoveY) < 0.8f) {
                         smMoveX = 0.f;
                         smMoveY = 0.f;
                         moveAccumX = 0.f;
