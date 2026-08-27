@@ -296,16 +296,15 @@ int main(int argc, char* argv[]) {
     const int scrH = fsm.screenHeight();
     const int imgW = fsm.imageWidth();
     const int imgH = fsm.imageHeight();
-    const float mouseSens = fsm.mouseSensitivity();  // 定位灵敏度系数
     float virtualMouseX = scrW / 2.f;   // 虚拟鼠标当前位置（屏幕坐标）
     float virtualMouseY = scrH / 2.f;
     bool  virtualInit = false;          // 锁定后首帧需初始化虚拟位置
-    float moveAccumX = 0.f;             // 小数位移残差累积器（保证不丢步）
-    float moveAccumY = 0.f;
-    // 位移 EMA 低通滤波（直线修正）：抑制手部高频抖动，
-    // 只有显著位移才注入，路径更直、更稳。
-    float smMoveX = 0.f;                // 平滑后位移（EMA 状态）
-    float smMoveY = 0.f;
+    // 目标坐标 EMA 低通滤波（直线修正）：对"食指尖目标坐标"做指数滑动平均，
+    // 抑制手部高频抖动（路径更直更稳），同时注入位移采用"全量差值"：
+    //   手指停在哪 → 虚拟鼠标最终精确到达哪 → 从画面一端划到另一端 = 屏幕满行程。
+    // 相比"位移 EMA + 部分注入"（旧方案，会收敛滞后、划不满屏）更符合绝对定位直觉。
+    float smTipX = -1.f;                // 平滑后目标坐标（画面像素，EMA 状态）
+    float smTipY = -1.f;
     // 拖拽期间隐藏画面窗口标志：拖拽时虚拟鼠标按住左键+移动，
     // 若指针落在画面窗口上会触发 GTK 窗口交互（拖动/点击），导致画面消失。
     // 方案：拖拽开始销毁窗口，结束立即重建，彻底避免冲突。
@@ -483,40 +482,33 @@ int main(int argc, char* argv[]) {
                     float tipX, tipY;
                     fsm.lastIndexTip(tipX, tipY);
                     if (tipX < 0 || tipY < 0) break;  // 尚未初始化
-                    // 画面坐标 → 屏幕坐标等比映射
-                    float targetX = tipX / imgW * scrW;
-                    float targetY = tipY / imgH * scrH;
+                    // ---- 目标坐标 EMA 低通滤波（直线修正）----
+                    // 对"指尖目标坐标"平滑（α=0.35），抑制高频抖动；路径更直。
+                    // 首帧直接初始化，避免从 0 开始导致跳变。
+                    const float kEmaAlpha = 0.35f;
+                    if (smTipX < 0) {
+                        smTipX = tipX;
+                        smTipY = tipY;
+                    } else {
+                        smTipX = kEmaAlpha * tipX + (1.f - kEmaAlpha) * smTipX;
+                        smTipY = kEmaAlpha * tipY + (1.f - kEmaAlpha) * smTipY;
+                    }
+                    // 死区：指尖与平滑目标偏差过小则暂停更新（手微抖不产生漂移）
+                    if (std::fabs(tipX - smTipX) < 0.5f && std::fabs(tipY - smTipY) < 0.5f) {
+                        break;
+                    }
+                    // 画面坐标 → 屏幕坐标等比映射（绝对定位：手指位置 = 屏幕位置）
+                    float targetX = smTipX / imgW * scrW;
+                    float targetY = smTipY / imgH * scrH;
                     // 首帧校准：以当前虚拟位置为基准，避免首帧跳变
                     if (!virtualInit) {
                         virtualMouseX = targetX;
                         virtualMouseY = targetY;
                         virtualInit = true;
                     }
-                    // 目标位移 × 灵敏度（提高响应速度）
-                    float wantDx = (targetX - virtualMouseX) * mouseSens;
-                    float wantDy = (targetY - virtualMouseY) * mouseSens;
-                    // ---- 位移 EMA 低通滤波（直线修正）----
-                    // 手部抖动是高频噪声，直接注入会让鼠标路径"蛇形"。
-                    // 用指数滑动平均：sm = α×本次 + (1-α)×上次，抑制高频抖动。
-                    // α 越小越平滑（路径直）但响应稍慢，取 0.35 偏平滑。
-                    const float kEmaAlpha = 0.35f;
-                    smMoveX = kEmaAlpha * wantDx + (1.f - kEmaAlpha) * smMoveX;
-                    smMoveY = kEmaAlpha * wantDy + (1.f - kEmaAlpha) * smMoveY;
-                    // 死区：平滑后位移过小则忽略（手微抖/停留时不产生漂移）
-                    if (std::fabs(smMoveX) < 0.8f && std::fabs(smMoveY) < 0.8f) {
-                        smMoveX = 0.f;
-                        smMoveY = 0.f;
-                        moveAccumX = 0.f;
-                        moveAccumY = 0.f;
-                        break;  // 本帧不注入位移
-                    }
-                    // 累积小数残差，整数部分注入 uinput（避免连续取整丢步）
-                    moveAccumX += smMoveX;
-                    moveAccumY += smMoveY;
-                    int dx = static_cast<int>(moveAccumX);
-                    int dy = static_cast<int>(moveAccumY);
-                    moveAccumX -= dx;
-                    moveAccumY -= dy;
+                    // 全量差值注入：虚拟位置直接追到目标（手指停哪鼠标就停哪）
+                    int dx = static_cast<int>(targetX - virtualMouseX);
+                    int dy = static_cast<int>(targetY - virtualMouseY);
                     if (dx != 0 || dy != 0) {
                         // 限制虚拟位置不越出屏幕边界（防止指针飞出导致窗口异常）
                         float nx = virtualMouseX + dx;

@@ -177,7 +177,9 @@ GestureEvent GestureFSM::handleFrame(const HandKeypoints& kpRaw, double dtMs) {
     HandKeypoints kp;
     smoothKeypoints(kpRaw, kp);
 
-    // 2. 手不存在或置信度过低：重置全部状态，若拖拽中先强制结束
+    // 2. 手不存在或置信度过低：重置手势状态，若拖拽中先强制结束。
+    //    注意：不再将 LOCKED 回退到 IDLE——手短暂离开画面应保持锁定状态，
+    //    否则手一离开画面就解锁，用户体验极差（保持 LOCKED 直到用户主动开掌解锁）。
     bool lowConfidence = (kpRaw.confidence < 0.5f);
     if (!kp.valid || kp.points.size() < kHandKeypointCount || lowConfidence) {
         m_holdMs = 0;
@@ -189,9 +191,7 @@ GestureEvent GestureFSM::handleFrame(const HandKeypoints& kpRaw, double dtMs) {
             lostEvent = GestureEvent::kDragEnd;
             std::printf("[FSM] 手丢失，拖拽强制结束\n");
         }
-        if (m_state == CtrlState::kLocked) {
-            m_state = CtrlState::kIdle;  // 手丢失回到空闲，避免误操作
-        }
+        // 保持当前状态不变（IDLE 保持 IDLE，LOCKED 保持 LOCKED）
         return lostEvent;
     }
 
