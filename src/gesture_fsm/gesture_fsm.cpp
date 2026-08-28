@@ -1,17 +1,18 @@
 // ============================================================================
 // gesture_fsm/gesture_fsm.cpp
-// 作用：GestureFSM 类实现（v2.2 食指弯曲控制方案核心模块）。
+// 作用：GestureFSM 类实现（v2.3 食指弯曲控制方案核心模块）。
 // 职责：
 //   1. 加载 JSON 配置（所有阈值外置）
 //   2. 对 21 关键点做卡尔曼平滑
-//   3. 依据 v2.2 状态机输出事件：开掌锁定/解锁、食指弯曲单击/拖拽、食指尖定位
+//   3. 依据 v2.3 状态机输出事件：开掌锁定/解锁、食指弯曲单击/拖拽、食指尖定位
 //
-// v2.2 食指弯曲检测原理：
-//   点击动作 = "食指弯曲"（食指尖折向中指根），与移动（手平移）完全正交：
-//   - 弯曲距离 = 食指尖(8)到中指根(9)的欧式距离
-//   - 距离 < bendDistThresholdPx → 弯曲（按下）
+// v2.3 食指弯曲检测原理：
+//   点击动作 = "食指弯曲"（食指尖折向掌心），与移动（手平移）完全正交：
+//   - 弯曲比值 = 食指尖(8)到食指根(5) 距离 / 食指根(5)到手腕(0) 距离
+//   - 比值 < bendRatio → 弯曲（按下）
 //   - 弯曲保持超过 bendHoldMs → 拖拽；在保持期内伸直 → 单击
-//   - 平移手时两指相对位置不变，移动永不误触发点击
+//   - 手指并拢（其他手指靠近食指）时食指仍伸直、比值不变 → 不会误判
+//   - 平移手时食指形态不变，移动永不误触发点击
 // ============================================================================
 
 #include "gesture_fsm/gesture_fsm.h"
@@ -72,10 +73,10 @@ bool GestureFSM::loadConfig(const std::string& configPath) {
     jsonGetFloat(json, "process_noise",         m_cfg.kalmanProcessNoise);
     jsonGetFloat(json, "measure_noise",         m_cfg.kalmanMeasureNoise);
     jsonGetFloat(json, "extension_ratio",              m_cfg.openPalmRatio);
-    jsonGetFloat(json, "bend_dist_threshold_px",       m_cfg.bendDistThresholdPx);
+    jsonGetFloat(json, "bend_ratio",                   m_cfg.bendRatio);
     jsonGetInt  (json, "bend_hold_ms",                m_cfg.bendHoldMs);
-    jsonGetFloat(json, "scale_x",                      m_cfg.mapScaleX);
-    jsonGetFloat(json, "scale_y",                      m_cfg.mapScaleY);
+    jsonGetFloat(json, "gain_x",                       m_cfg.mouseGainX);
+    jsonGetFloat(json, "gain_y",                       m_cfg.mouseGainY);
     jsonGetInt  (json, "width",                       m_cfg.imageWidth);
     jsonGetInt  (json, "height",                      m_cfg.imageHeight);
     jsonGetInt  (json, "screen_width",                m_cfg.screenWidth);
@@ -87,10 +88,10 @@ bool GestureFSM::loadConfig(const std::string& configPath) {
     }
 
     m_cfgLoaded = true;
-    std::printf("[GestureFSM] 配置加载成功(v2.2): %s\n", configPath.c_str());
-    std::printf("[GestureFSM] 锁定阈值=%dms 屏幕=%dx%d 弯曲距离=%.0fpx 缩放=%.2fx%.2f\n",
+    std::printf("[GestureFSM] 配置加载成功(v2.3): %s\n", configPath.c_str());
+    std::printf("[GestureFSM] 锁定阈值=%dms 屏幕=%dx%d 弯曲比值=%.2f 增益=%.2fx%.2f\n",
                 m_cfg.lockHoldMs, m_cfg.screenWidth, m_cfg.screenHeight,
-                m_cfg.bendDistThresholdPx, m_cfg.mapScaleX, m_cfg.mapScaleY);
+                m_cfg.bendRatio, m_cfg.mouseGainX, m_cfg.mouseGainY);
     return true;
 }
 
@@ -243,21 +244,26 @@ GestureEvent GestureFSM::handleFrame(const HandKeypoints& kpRaw, double dtMs) {
             m_smoothTipX = kp.points[8].x;
             m_smoothTipY = kp.points[8].y;
 
-            // 食指弯曲距离 = 食指尖(8)到中指根(9)的欧式距离
-            // 伸直时两指分开（距离大），弯曲点击时食指尖折向中指根（距离骤减）。
-            // 与手平移完全正交：平移时两指相对位置不变，移动永不误触发点击。
-            float bendDist = distance(kp.points[8].x, kp.points[8].y,
-                                      kp.points[9].x, kp.points[9].y);
-            bool bent = (bendDist < m_cfg.bendDistThresholdPx);
+            // 食指弯曲比值 = 食指尖(8)到食指根(5) 距离 / 食指根(5)到手腕(0) 距离
+            // 用"食指自身折叠程度"判定：伸直时比值 ≈1.0~1.5，弯曲点击时食指尖折向
+            // 掌心、比值骤降。与手平移完全正交（平移时食指形态不变），且手指并拢
+            // （其他手指靠近食指）时食指仍伸直、比值不变 → 不会误判为弯曲。
+            // 注：比值法对"手指朝屏幕"的投影缩短鲁棒（分子分母同缩）。
+            float tipToRoot = distance(kp.points[8].x, kp.points[8].y,
+                                       kp.points[5].x, kp.points[5].y);
+            float rootToWrist = distance(kp.points[5].x, kp.points[5].y,
+                                         kp.points[0].x, kp.points[0].y);
+            float bendRatio = (rootToWrist > 1e-6f) ? (tipToRoot / rootToWrist) : 1.f;
+            bool bent = (bendRatio < m_cfg.bendRatio);
 
             if (!m_bending && !m_dragging) {
                 // ---- 空闲：检测弯曲（点击/拖拽的开始动作）----
                 if (bent) {
                     m_bending = true;
                     m_bendHoldMs = 0;
-                    std::printf("[FSM] 弯曲开始（距离=%.0fpx）\n", bendDist);
+                    std::printf("[FSM] 弯曲开始（比值=%.2f）\n", bendRatio);
                 } else {
-                    event = GestureEvent::kPointerMove;  // 伸直：绝对定位移动
+                    event = GestureEvent::kPointerMove;  // 伸直：相对位移移动
                 }
             } else if (m_dragging) {
                 // ---- 拖拽中：检测伸直结束 ----

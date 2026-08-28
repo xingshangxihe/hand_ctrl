@@ -7,15 +7,15 @@
 //   推理线程:   从帧队列取帧 → ONNXInfer::infer → 关键点队列
 //   主线程  :   从关键点队列取 → GestureFSM::handleFrame → UInputManager 输出
 //
-// v2.2 交互模型（食指弯曲控制）：
+// v2.3 交互模型（食指弯曲控制 + 相对位移）：
 //   开掌1s = 锁定/解锁
-//   锁定后：食指伸直 → 食指尖绝对定位鼠标
+//   锁定后：食指伸直 → 食指尖相对位移控制鼠标（触控板式，可累计到屏幕任意位置）
 //   食指快速弯曲→伸直 = 单击；弯曲保持 = 拖拽（移动跟手，伸直释放）
 //
-// 绝对定位实现要点：
-//   uinput 是相对位移设备，需软件维护"虚拟鼠标位置"：
-//   每次计算 目标位置 - 虚拟位置 = 相对位移，注入后更新虚拟位置。
-//   （若虚拟位置与真实指针脱节，可用物理鼠标微调，或重新锁定/解锁一次校准）
+// 相对位移实现要点：
+//   鼠标位移 = 指尖画面位移 × (屏幕/画面) × 增益系数。
+//   手可在画面内来回移动多次，位移持续累计 → 鼠标能覆盖整个屏幕
+//   （绝对定位要求手覆盖整个画面才能覆盖整个屏幕，活动范围有限做不到）。
 //
 // 线程间通信：std::mutex + std::condition_variable + 共享队列（生产-消费者模型）
 // 信号处理：Ctrl+C 优雅退出，析构释放所有资源（RAII）
@@ -285,29 +285,23 @@ int main(int argc, char* argv[]) {
     int fsmCnt = 0;
     int waitLogCnt = 0;
 
-    // v2 绝对定位：软件维护虚拟鼠标位置（相对位移设备无法直接"跳到"目标坐标）
-    // 映射公式：screenPos = fingerPos / imageSize * screenSize
-    // 每次注入 (虚拟目标 - 当前虚拟位置) × 灵敏度 的相对位移，并更新虚拟位置。
-    // 说明：
-    //   1. 灵敏度 >1 使鼠标移动更快（指尖小幅移动 → 鼠标大幅移动）
-    //   2. 使用 float 累积位移 + 整数残差，避免连续取整丢步导致"不灵敏"
-    //   3. 锁定瞬间虚拟位置初始化为屏幕中心（等价于手指落在画面中心时指针在屏幕中心）
+    // v2.3 相对位移模式（触控板式）：解决绝对定位"手活动范围有限 → 覆盖不了整个屏幕"
+    //   绝对定位要求手覆盖整个画面才能覆盖整个屏幕，但用户手活动范围有限。
+    //   相对位移：鼠标位移 = 指尖画面位移 × (屏幕尺寸/画面尺寸) × 增益系数，
+    //   手可以在画面内来回移动多次，位移持续累计 → 鼠标能到达屏幕任意位置。
     const int scrW = fsm.screenWidth();
     const int scrH = fsm.screenHeight();
     const int imgW = fsm.imageWidth();
     const int imgH = fsm.imageHeight();
-    // 绝对定位映射缩放系数（各方向独立，解决"某方向覆盖范围不足"）
-    const float scaleX = fsm.mapScaleX();
-    const float scaleY = fsm.mapScaleY();
-    float virtualMouseX = scrW / 2.f;   // 虚拟鼠标当前位置（屏幕坐标）
-    float virtualMouseY = scrH / 2.f;
-    bool  virtualInit = false;          // 锁定后首帧需初始化虚拟位置
-    // 目标坐标 EMA 低通滤波（直线修正）：对"食指尖目标坐标"做指数滑动平均，
-    // 抑制手部高频抖动（路径更直更稳），同时注入位移采用"全量差值"：
-    //   手指停在哪 → 虚拟鼠标最终精确到达哪 → 从画面一端划到另一端 = 屏幕满行程。
-    // 相比"位移 EMA + 部分注入"（旧方案，会收敛滞后、划不满屏）更符合绝对定位直觉。
-    float smTipX = -1.f;                // 平滑后目标坐标（画面像素，EMA 状态）
+    // 相对位移增益系数（各方向独立）：基础系数=屏幕/画面，再乘 gain
+    const float gainX = fsm.mouseGainX();
+    const float gainY = fsm.mouseGainY();
+    // 指尖坐标 EMA 低通滤波（直线修正）：抑制手部高频抖动，路径更直更稳。
+    // 用平滑后的坐标计算帧间位移（而非原始坐标），进一步降抖。
+    float smTipX = -1.f;                // 平滑后食指尖坐标（画面像素，EMA 状态）
     float smTipY = -1.f;
+    float lastSmTipX = -1.f;            // 上一帧平滑坐标（用于计算帧间位移）
+    float lastSmTipY = -1.f;
     // 拖拽期间隐藏画面窗口标志：拖拽时虚拟鼠标按住左键+移动，
     // 若指针落在画面窗口上会触发 GTK 窗口交互（拖动/点击），导致画面消失。
     // 方案：拖拽开始销毁窗口，结束立即重建，彻底避免冲突。
@@ -411,6 +405,11 @@ int main(int argc, char* argv[]) {
         double dtMs = std::chrono::duration<double, std::milli>(now - lastTime).count();
         lastTime = now;
 
+        // 手丢失/无效时重置位移参考点（手重新出现时不产生瞬移）
+        if (!kp.valid || kp.points.size() < 21) {
+            smTipX = smTipY = lastSmTipX = lastSmTipY = -1.f;
+        }
+
         // FSM 推进
         GestureEvent e = fsm.handleFrame(kp, dtMs);
         ++fsmCnt;
@@ -474,20 +473,19 @@ int main(int argc, char* argv[]) {
                 std::printf("[main] 状态切换: %s\n", fsm.currentStateName());
                 // 安全释放左键：若此前在拖拽/按下中，必须释放避免鼠标卡住
                 uinput.releaseLeft();
-                // 锁定瞬间初始化虚拟鼠标位置（锁定后手指落在画面何处，指针从屏幕中心起算）
-                virtualInit = false;
+                // 状态切换后重置位移参考点（防止手位置跳变导致鼠标瞬移）
+                smTipX = smTipY = lastSmTipX = lastSmTipY = -1.f;
                 break;
 
             case GestureEvent::kPointerMove:
             case GestureEvent::kDragMove:
-                // 绝对定位移动（锁定定位 / 拖拽中跟手）：食指指尖坐标 → 屏幕坐标
+                // 相对位移移动（触控板式，锁定定位 / 拖拽中跟手）
                 {
                     float tipX, tipY;
                     fsm.lastIndexTip(tipX, tipY);
                     if (tipX < 0 || tipY < 0) break;  // 尚未初始化
-                    // ---- 目标坐标 EMA 低通滤波（直线修正）----
-                    // 对"指尖目标坐标"平滑（α=0.35），抑制高频抖动；路径更直。
-                    // 首帧直接初始化，避免从 0 开始导致跳变。
+                    // ---- 指尖坐标 EMA 低通滤波（直线修正）----
+                    // 平滑后坐标计算帧间位移，抑制手部高频抖动。
                     const float kEmaAlpha = 0.35f;
                     if (smTipX < 0) {
                         smTipX = tipX;
@@ -496,36 +494,28 @@ int main(int argc, char* argv[]) {
                         smTipX = kEmaAlpha * tipX + (1.f - kEmaAlpha) * smTipX;
                         smTipY = kEmaAlpha * tipY + (1.f - kEmaAlpha) * smTipY;
                     }
-                    // 死区：指尖与平滑目标偏差过小则暂停更新（手微抖不产生漂移）
-                    if (std::fabs(tipX - smTipX) < 0.5f && std::fabs(tipY - smTipY) < 0.5f) {
+                    // 首帧初始化参考点（避免首帧跳变）
+                    if (lastSmTipX < 0) {
+                        lastSmTipX = smTipX;
+                        lastSmTipY = smTipY;
                         break;
                     }
-                    // 画面坐标 → 屏幕坐标等比映射（绝对定位：手指位置 = 屏幕位置）
-                    // 各方向乘以独立缩放系数：scaleX/scaleY >1 时该方向覆盖行程放大，
-                    // 解决"向上移动覆盖不了整个范围"（手抬手物理行程有限）。
-                    // 注意：映射后需 clamp 到屏幕范围（下面已有边界限制）。
-                    float targetX = smTipX / imgW * scrW * scaleX;
-                    float targetY = smTipY / imgH * scrH * scaleY;
-                    // 首帧校准：以当前虚拟位置为基准，避免首帧跳变
-                    if (!virtualInit) {
-                        virtualMouseX = targetX;
-                        virtualMouseY = targetY;
-                        virtualInit = true;
+                    // ---- 帧间相对位移（画面像素）----
+                    float dImgX = smTipX - lastSmTipX;
+                    float dImgY = smTipY - lastSmTipY;
+                    lastSmTipX = smTipX;
+                    lastSmTipY = smTipY;
+                    // 死区：微小位移忽略（手微抖/停留时不产生漂移）
+                    if (std::fabs(dImgX) < 0.3f && std::fabs(dImgY) < 0.3f) {
+                        break;
                     }
-                    // 全量差值注入：虚拟位置直接追到目标（手指停哪鼠标就停哪）
-                    int dx = static_cast<int>(targetX - virtualMouseX);
-                    int dy = static_cast<int>(targetY - virtualMouseY);
+                    // ---- 映射到屏幕位移：画面像素 × (屏幕/画面) × 增益 ----
+                    // 相对位移可累计：手在小范围内来回移动多次，
+                    // 鼠标持续移动 → 能到达屏幕任意位置（绝对定位做不到）。
+                    int dx = static_cast<int>(dImgX / imgW * scrW * gainX);
+                    int dy = static_cast<int>(dImgY / imgH * scrH * gainY);
                     if (dx != 0 || dy != 0) {
-                        // 限制虚拟位置不越出屏幕边界（防止指针飞出导致窗口异常）
-                        float nx = virtualMouseX + dx;
-                        float ny = virtualMouseY + dy;
-                        dx = static_cast<int>(std::max(0.f, std::min(static_cast<float>(scrW), nx)) - virtualMouseX);
-                        dy = static_cast<int>(std::max(0.f, std::min(static_cast<float>(scrH), ny)) - virtualMouseY);
-                        if (dx != 0 || dy != 0) {
-                            uinput.moveMouse(dx, dy);
-                            virtualMouseX += dx;
-                            virtualMouseY += dy;
-                        }
+                        uinput.moveMouse(dx, dy);
                     }
                 }
                 break;
