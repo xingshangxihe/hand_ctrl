@@ -73,8 +73,8 @@ bool GestureFSM::loadConfig(const std::string& configPath) {
     jsonGetFloat(json, "process_noise",         m_cfg.kalmanProcessNoise);
     jsonGetFloat(json, "measure_noise",         m_cfg.kalmanMeasureNoise);
     jsonGetFloat(json, "extension_ratio",              m_cfg.openPalmRatio);
-    jsonGetInt  (json, "distance_threshold_px",        m_cfg.fistDistThresholdPx);
-    jsonGetInt  (json, "fist_hold_ms",                m_cfg.fistHoldMs);
+    jsonGetFloat(json, "pinch_dist_threshold_px",      m_cfg.pinchDistThresholdPx);
+    jsonGetInt  (json, "fold_distance_threshold_px",   m_cfg.dragFoldDistPx);
     jsonGetFloat(json, "gain_x",                       m_cfg.mouseGainX);
     jsonGetFloat(json, "gain_y",                       m_cfg.mouseGainY);
     jsonGetInt  (json, "width",                       m_cfg.imageWidth);
@@ -88,10 +88,11 @@ bool GestureFSM::loadConfig(const std::string& configPath) {
     }
 
     m_cfgLoaded = true;
-    std::printf("[GestureFSM] 配置加载成功(v2.4): %s\n", configPath.c_str());
-    std::printf("[GestureFSM] 锁定阈值=%dms 屏幕=%dx%d 握拳距离=%dpx 增益=%.2fx%.2f\n",
+    std::printf("[GestureFSM] 配置加载成功(v2.5): %s\n", configPath.c_str());
+    std::printf("[GestureFSM] 锁定阈值=%dms 屏幕=%dx%d 捏合距离=%.0fpx 双指V折叠=%dpx 增益=%.2fx%.2f\n",
                 m_cfg.lockHoldMs, m_cfg.screenWidth, m_cfg.screenHeight,
-                m_cfg.fistDistThresholdPx, m_cfg.mouseGainX, m_cfg.mouseGainY);
+                m_cfg.pinchDistThresholdPx, m_cfg.dragFoldDistPx,
+                m_cfg.mouseGainX, m_cfg.mouseGainY);
     return true;
 }
 
@@ -164,25 +165,30 @@ bool GestureFSM::detectOpenPalm(const HandKeypoints& kp) {
     return true;  // 5 指全部伸直 = 开掌
 }
 
-// --------------------------- 握拳判定（点击/拖拽动作） ---------------------------
-// 判定：所有 5 指尖(4,8,12,16,20)到手腕(0)距离均 < fistDistThresholdPx。
-// 与"食指伸出移动"天然互斥：握拳时食指尖也收拢（距离 < 阈值），
-// 移动时食指尖伸直（距离 > 阈值）→ 两者绝不可能同时满足，杜绝误判。
-bool GestureFSM::detectFist(const HandKeypoints& kp) {
+// --------------------------- 双指V判定（拖拽手势） ---------------------------
+// 判定：食指(8)+中指(12)伸直（指尖到手腕/指根到手腕比值 > openPalmRatio），
+//       无名指(16)+小指(20)弯曲（到手腕距离 < dragFoldDistPx）。
+// 显式手型：与移动（单指/张手）、单击（捏合）完全不同，绝无冲突。
+// 说明：摆出"V"字手势（两根手指比胜利）即进入拖拽，收手即释放。
+bool GestureFSM::detectTwoFinger(const HandKeypoints& kp) {
     if (kp.points.size() < 21) return false;
     const auto& w = kp.points[0];  // 手腕
-    const int tips[] = {4, 8, 12, 16, 20};  // 5 个指尖索引
 
-    float maxTipDist = 0.f;
-    for (int t : tips) {
-        float d = distance(kp.points[t].x, kp.points[t].y, w.x, w.y);
-        if (d >= m_cfg.fistDistThresholdPx) return false;  // 任一指尖伸直 → 非握拳
-        maxTipDist = std::max(maxTipDist, d);
+    // 食指(8)/中指(12)必须伸直：指尖/指根 比值 > 阈值
+    {
+        float tip = distance(kp.points[8].x, kp.points[8].y, w.x, w.y);
+        float root = distance(kp.points[5].x, kp.points[5].y, w.x, w.y);
+        if (root < 1e-6f || tip / root < m_cfg.openPalmRatio) return false;
     }
-    // 手部跨度兜底：跨度过小视为噪声/无效关键点
-    const float minHandSpan = 30.f;
-    if (maxTipDist < minHandSpan) return false;
-    return true;  // 5 指全部收拢 = 握拳
+    {
+        float tip = distance(kp.points[12].x, kp.points[12].y, w.x, w.y);
+        float root = distance(kp.points[9].x, kp.points[9].y, w.x, w.y);
+        if (root < 1e-6f || tip / root < m_cfg.openPalmRatio) return false;
+    }
+    // 无名指(16)/小指(20)必须弯曲：到手腕距离 < 阈值
+    if (distance(kp.points[16].x, kp.points[16].y, w.x, w.y) >= m_cfg.dragFoldDistPx) return false;
+    if (distance(kp.points[20].x, kp.points[20].y, w.x, w.y) >= m_cfg.dragFoldDistPx) return false;
+    return true;  // 双指V成立
 }
 
 // --------------------------- 状态机主循环 ---------------------------
@@ -207,10 +213,9 @@ GestureEvent GestureFSM::handleFrame(const HandKeypoints& kpRaw, double dtMs) {
     if (!kp.valid || kp.points.size() < kHandKeypointCount || lowConfidence) {
         m_holdMs = 0;
         GestureEvent lostEvent = GestureEvent::kNone;
-        if (m_dragging || m_fisting) {
+        if (m_dragging || m_pinched) {
             m_dragging = false;
-            m_fisting = false;
-            m_fistHoldMs = 0;
+            m_pinched = false;
             lostEvent = GestureEvent::kDragEnd;
             std::printf("[FSM] 手丢失，拖拽强制结束\n");
         }
@@ -243,7 +248,7 @@ GestureEvent GestureFSM::handleFrame(const HandKeypoints& kpRaw, double dtMs) {
             break;
 
         case CtrlState::kLocked:
-            // LOCKED 态：开掌解锁 / 握拳控制（单击/拖拽）+ 食指伸出（移动）
+            // LOCKED 态：开掌解锁 / 捏合单击 + 双指V拖拽 + 食指伸出（移动）
             if (detectOpenPalm(kp)) {
                 // ---- 开掌：累计长按解锁 ----
                 m_holdMs += static_cast<int>(dtMs);
@@ -251,8 +256,7 @@ GestureEvent GestureFSM::handleFrame(const HandKeypoints& kpRaw, double dtMs) {
                     m_state = CtrlState::kIdle;
                     m_holdMs = 0;
                     m_cooldownMs = m_cfg.stateCooldownMs;
-                    m_fisting = false;
-                    m_fistHoldMs = 0;
+                    m_pinched = false;
                     m_dragging = false;
                     event = GestureEvent::kOpenPalmHold;
                     std::printf("[FSM] 状态迁移：LOCKED → IDLE（已解锁）\n");
@@ -260,52 +264,53 @@ GestureEvent GestureFSM::handleFrame(const HandKeypoints& kpRaw, double dtMs) {
                 break;  // 开掌期间不响应定位/点击
             }
 
-            // ---- 非开掌：握拳控制（点击/拖拽）或食指伸出（移动） ----
+            // ---- 非开掌：捏合单击 / 双指V拖拽 / 食指伸出移动 ----
             // 记录平滑后掌心（点9，中指根）坐标供上层做相对位移
-            // （掌心在手部中央，握拳时也可用；食指尖握拳时收拢不可用）
+            // （掌心在手部中央，双指V拖拽时也可用）
             m_smoothPalmX = kp.points[9].x;
             m_smoothPalmY = kp.points[9].y;
 
-            // 握拳判定：5 指尖到手腕距离均 < 阈值（与"食指伸出"天然互斥）
-            bool fisted = detectFist(kp);
+            // 单击判定：捏合 = 拇指尖(4)与食指尖(8)距离 < 阈值
+            float pinchDist = distance(kp.points[4].x, kp.points[4].y,
+                                       kp.points[8].x, kp.points[8].y);
+            bool pinched = (pinchDist < m_cfg.pinchDistThresholdPx);
 
-            if (!m_fisting && !m_dragging) {
-                // ---- 空闲：检测握拳（点击/拖拽的开始动作）----
-                if (fisted) {
-                    m_fisting = true;
-                    m_fistHoldMs = 0;
-                    std::printf("[FSM] 握拳开始\n");
-                } else {
-                    event = GestureEvent::kPointerMove;  // 非握拳（食指伸出）：相对位移移动
-                }
-            } else if (m_dragging) {
-                // ---- 拖拽中：检测松开结束 ----
-                if (!fisted) {
-                    m_dragging = false;
-                    m_fisting = false;
-                    m_fistHoldMs = 0;
-                    event = GestureEvent::kDragEnd;
-                    std::printf("[FSM] 拖拽结束（松开握拳）\n");
-                } else {
-                    event = GestureEvent::kDragMove;  // 拖拽移动：跟手
-                }
-            } else {
-                // ---- 握拳判定中：区分单击与拖拽 ----
-                m_fistHoldMs += static_cast<int>(dtMs);
-                if (!fisted) {
-                    // 松开且未达拖拽阈值：单击
-                    m_fisting = false;
-                    m_fistHoldMs = 0;
-                    event = GestureEvent::kClick;
-                    std::printf("[FSM] 单击（握拳 %dms）\n", m_fistHoldMs);
-                } else if (m_fistHoldMs >= m_cfg.fistHoldMs) {
-                    // 握拳保持超时：进入拖拽
+            // 拖拽判定：双指V手势（食指+中指伸直、无名指+小指弯曲）
+            bool twoFinger = detectTwoFinger(kp);
+
+            // ---- 双指V拖拽：优先级最高（显式手势，与移动/捏合完全不同）----
+            if (twoFinger) {
+                if (!m_dragging) {
                     m_dragging = true;
-                    m_fisting = false;
+                    m_pinched = false;  // 拖拽期间不响应捏合
                     event = GestureEvent::kDragStart;
-                    std::printf("[FSM] 拖拽开始（握拳 %dms）\n", m_fistHoldMs);
+                    std::printf("[FSM] 拖拽开始（双指V）\n");
+                } else {
+                    event = GestureEvent::kDragMove;  // 双指V保持：拖拽移动
                 }
-                // 其余情况：握拳中尚未定性，等待（不发移动，避免误动）
+                break;  // 双指V期间不处理移动/单击
+            }
+
+            // ---- 拖拽结束：双指V解除 ----
+            if (m_dragging) {
+                m_dragging = false;
+                event = GestureEvent::kDragEnd;
+                std::printf("[FSM] 拖拽结束（解除双指V）\n");
+                break;
+            }
+
+            // ---- 捏合单击（边沿触发防连发）----
+            if (pinched) {
+                if (!m_pinched) {
+                    m_pinched = true;
+                    event = GestureEvent::kClick;
+                    std::printf("[FSM] 单击（捏合 tap）\n");
+                }
+                // 捏合保持中：不发移动，避免误动
+            } else {
+                m_pinched = false;  // 解除捏合，允许下次边沿触发
+                // ---- 食指伸出：相对位移移动 ----
+                event = GestureEvent::kPointerMove;
             }
             break;
     }

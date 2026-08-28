@@ -31,10 +31,14 @@
     "_说明": "锁定/解锁手势判定：5 根手指均伸直——每指指尖到手腕距离 / 该指根(MCP)到手腕距离 > extension_ratio（拇指阈值自动放宽×0.8，因其根紧邻手腕）。比值法对投影缩短鲁棒"
   },
 
-  "fist": {
-    "distance_threshold_px": 160,
-    "fist_hold_ms": 350,
-    "_说明": "握拳点击/拖拽判定（v2.4 核心）：所有 5 指尖(4,8,12,16,20)到手腕(0)距离 < distance_threshold_px = 握拳。与'食指伸出移动'天然互斥（握拳时食指尖也收拢、移动时食指尖伸直），绝无冲突。快速握拳→松开=单击；握拳保持超过 fist_hold_ms=拖拽开始，保持中移动=拖拽，松开=释放。key 用 fist_ 前缀避免与 lock.hold_time_ms 同名冲突"
+  "click": {
+    "pinch_dist_threshold_px": 40,
+    "_说明": "单击判定（v2.5）：拇指尖(4)与食指尖(8)距离 < pinch_dist_threshold_px = 捏合 → 触发左键单击（瞬时 tap，边沿触发防连发）。捏合检测可靠且独立于平移，只做瞬时动作不累"
+  },
+
+  "drag": {
+    "fold_distance_threshold_px": 130,
+    "_说明": "拖拽判定（v2.5）：双指V手势——食指(8)与中指(12)均伸直（指尖/指根比值 > open_palm.extension_ratio），无名指(16)与小指(20)到手腕距离 < fold_distance_threshold_px（弯曲）。显式手型，与移动（单指/张手）和单击（捏合）完全不同，绝无冲突。摆V=按住左键拖拽，保持V移动=跟手，收手=释放"
   },
 
   "mouse": {
