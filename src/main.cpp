@@ -7,10 +7,10 @@
 //   推理线程:   从帧队列取帧 → ONNXInfer::infer → 关键点队列
 //   主线程  :   从关键点队列取 → GestureFSM::handleFrame → UInputManager 输出
 //
-// v2.3 交互模型（食指弯曲控制 + 相对位移）：
+// v2.4 交互模型（握拳点击 + 相对位移）：
 //   开掌1s = 锁定/解锁
-//   锁定后：食指伸直 → 食指尖相对位移控制鼠标（触控板式，可累计到屏幕任意位置）
-//   食指快速弯曲→伸直 = 单击；弯曲保持 = 拖拽（移动跟手，伸直释放）
+//   锁定后：手移动 → 掌心相对位移控制鼠标（触控板式，可累计到屏幕任意位置）
+//   快速握拳→松开 = 单击；握拳保持 = 拖拽（移动跟手，松开释放）
 //
 // 相对位移实现要点：
 //   鼠标位移 = 指尖画面位移 × (屏幕/画面) × 增益系数。
@@ -296,12 +296,13 @@ int main(int argc, char* argv[]) {
     // 相对位移增益系数（各方向独立）：基础系数=屏幕/画面，再乘 gain
     const float gainX = fsm.mouseGainX();
     const float gainY = fsm.mouseGainY();
-    // 指尖坐标 EMA 低通滤波（直线修正）：抑制手部高频抖动，路径更直更稳。
+    // 掌心坐标 EMA 低通滤波（直线修正）：抑制手部高频抖动，路径更直更稳。
     // 用平滑后的坐标计算帧间位移（而非原始坐标），进一步降抖。
-    float smTipX = -1.f;                // 平滑后食指尖坐标（画面像素，EMA 状态）
-    float smTipY = -1.f;
-    float lastSmTipX = -1.f;            // 上一帧平滑坐标（用于计算帧间位移）
-    float lastSmTipY = -1.f;
+    // 参考点用掌心（点9）而非食指尖：握拳拖拽时食指尖收拢不可用，掌心始终可见。
+    float smPalmX = -1.f;               // 平滑后掌心坐标（画面像素，EMA 状态）
+    float smPalmY = -1.f;
+    float lastSmPalmX = -1.f;           // 上一帧平滑坐标（用于计算帧间位移）
+    float lastSmPalmY = -1.f;
     // 拖拽期间隐藏画面窗口标志：拖拽时虚拟鼠标按住左键+移动，
     // 若指针落在画面窗口上会触发 GTK 窗口交互（拖动/点击），导致画面消失。
     // 方案：拖拽开始销毁窗口，结束立即重建，彻底避免冲突。
@@ -407,7 +408,7 @@ int main(int argc, char* argv[]) {
 
         // 手丢失/无效时重置位移参考点（手重新出现时不产生瞬移）
         if (!kp.valid || kp.points.size() < 21) {
-            smTipX = smTipY = lastSmTipX = lastSmTipY = -1.f;
+            smPalmX = smPalmY = lastSmPalmX = lastSmPalmY = -1.f;
         }
 
         // FSM 推进
@@ -474,37 +475,37 @@ int main(int argc, char* argv[]) {
                 // 安全释放左键：若此前在拖拽/按下中，必须释放避免鼠标卡住
                 uinput.releaseLeft();
                 // 状态切换后重置位移参考点（防止手位置跳变导致鼠标瞬移）
-                smTipX = smTipY = lastSmTipX = lastSmTipY = -1.f;
+                smPalmX = smPalmY = lastSmPalmX = lastSmPalmY = -1.f;
                 break;
 
             case GestureEvent::kPointerMove:
             case GestureEvent::kDragMove:
                 // 相对位移移动（触控板式，锁定定位 / 拖拽中跟手）
                 {
-                    float tipX, tipY;
-                    fsm.lastIndexTip(tipX, tipY);
-                    if (tipX < 0 || tipY < 0) break;  // 尚未初始化
-                    // ---- 指尖坐标 EMA 低通滤波（直线修正）----
+                    float palmX, palmY;
+                    fsm.lastPalmPoint(palmX, palmY);
+                    if (palmX < 0 || palmY < 0) break;  // 尚未初始化
+                    // ---- 掌心坐标 EMA 低通滤波（直线修正）----
                     // 平滑后坐标计算帧间位移，抑制手部高频抖动。
                     const float kEmaAlpha = 0.35f;
-                    if (smTipX < 0) {
-                        smTipX = tipX;
-                        smTipY = tipY;
+                    if (smPalmX < 0) {
+                        smPalmX = palmX;
+                        smPalmY = palmY;
                     } else {
-                        smTipX = kEmaAlpha * tipX + (1.f - kEmaAlpha) * smTipX;
-                        smTipY = kEmaAlpha * tipY + (1.f - kEmaAlpha) * smTipY;
+                        smPalmX = kEmaAlpha * palmX + (1.f - kEmaAlpha) * smPalmX;
+                        smPalmY = kEmaAlpha * palmY + (1.f - kEmaAlpha) * smPalmY;
                     }
                     // 首帧初始化参考点（避免首帧跳变）
-                    if (lastSmTipX < 0) {
-                        lastSmTipX = smTipX;
-                        lastSmTipY = smTipY;
+                    if (lastSmPalmX < 0) {
+                        lastSmPalmX = smPalmX;
+                        lastSmPalmY = smPalmY;
                         break;
                     }
                     // ---- 帧间相对位移（画面像素）----
-                    float dImgX = smTipX - lastSmTipX;
-                    float dImgY = smTipY - lastSmTipY;
-                    lastSmTipX = smTipX;
-                    lastSmTipY = smTipY;
+                    float dImgX = smPalmX - lastSmPalmX;
+                    float dImgY = smPalmY - lastSmPalmY;
+                    lastSmPalmX = smPalmX;
+                    lastSmPalmY = smPalmY;
                     // 死区：微小位移忽略（手微抖/停留时不产生漂移）
                     if (std::fabs(dImgX) < 0.3f && std::fabs(dImgY) < 0.3f) {
                         break;

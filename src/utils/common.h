@@ -23,8 +23,8 @@ static constexpr int kTargetFps    = 30;    // 目标帧率（帧/秒）
 // MediaPipe Hands 输出 21 个手部关键点
 static constexpr int kHandKeypointCount = 21;
 
-// 程序版本号（v2.3：食指弯曲 + 相对位移方案）
-static constexpr const char* kProjectVersion = "2.3.0";
+// 程序版本号（v2.4：握拳点击 + 相对位移方案）
+static constexpr const char* kProjectVersion = "2.4.0";
 
 // --------------------------- 错误码枚举 ---------------------------
 // 各模块异常情况的统一错误码，配合阶段约束「输出清晰中文日志」使用

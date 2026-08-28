@@ -73,8 +73,8 @@ bool GestureFSM::loadConfig(const std::string& configPath) {
     jsonGetFloat(json, "process_noise",         m_cfg.kalmanProcessNoise);
     jsonGetFloat(json, "measure_noise",         m_cfg.kalmanMeasureNoise);
     jsonGetFloat(json, "extension_ratio",              m_cfg.openPalmRatio);
-    jsonGetFloat(json, "bend_ratio",                   m_cfg.bendRatio);
-    jsonGetInt  (json, "bend_hold_ms",                m_cfg.bendHoldMs);
+    jsonGetInt  (json, "distance_threshold_px",        m_cfg.fistDistThresholdPx);
+    jsonGetInt  (json, "fist_hold_ms",                m_cfg.fistHoldMs);
     jsonGetFloat(json, "gain_x",                       m_cfg.mouseGainX);
     jsonGetFloat(json, "gain_y",                       m_cfg.mouseGainY);
     jsonGetInt  (json, "width",                       m_cfg.imageWidth);
@@ -88,10 +88,10 @@ bool GestureFSM::loadConfig(const std::string& configPath) {
     }
 
     m_cfgLoaded = true;
-    std::printf("[GestureFSM] 配置加载成功(v2.3): %s\n", configPath.c_str());
-    std::printf("[GestureFSM] 锁定阈值=%dms 屏幕=%dx%d 弯曲比值=%.2f 增益=%.2fx%.2f\n",
+    std::printf("[GestureFSM] 配置加载成功(v2.4): %s\n", configPath.c_str());
+    std::printf("[GestureFSM] 锁定阈值=%dms 屏幕=%dx%d 握拳距离=%dpx 增益=%.2fx%.2f\n",
                 m_cfg.lockHoldMs, m_cfg.screenWidth, m_cfg.screenHeight,
-                m_cfg.bendRatio, m_cfg.mouseGainX, m_cfg.mouseGainY);
+                m_cfg.fistDistThresholdPx, m_cfg.mouseGainX, m_cfg.mouseGainY);
     return true;
 }
 
@@ -164,6 +164,27 @@ bool GestureFSM::detectOpenPalm(const HandKeypoints& kp) {
     return true;  // 5 指全部伸直 = 开掌
 }
 
+// --------------------------- 握拳判定（点击/拖拽动作） ---------------------------
+// 判定：所有 5 指尖(4,8,12,16,20)到手腕(0)距离均 < fistDistThresholdPx。
+// 与"食指伸出移动"天然互斥：握拳时食指尖也收拢（距离 < 阈值），
+// 移动时食指尖伸直（距离 > 阈值）→ 两者绝不可能同时满足，杜绝误判。
+bool GestureFSM::detectFist(const HandKeypoints& kp) {
+    if (kp.points.size() < 21) return false;
+    const auto& w = kp.points[0];  // 手腕
+    const int tips[] = {4, 8, 12, 16, 20};  // 5 个指尖索引
+
+    float maxTipDist = 0.f;
+    for (int t : tips) {
+        float d = distance(kp.points[t].x, kp.points[t].y, w.x, w.y);
+        if (d >= m_cfg.fistDistThresholdPx) return false;  // 任一指尖伸直 → 非握拳
+        maxTipDist = std::max(maxTipDist, d);
+    }
+    // 手部跨度兜底：跨度过小视为噪声/无效关键点
+    const float minHandSpan = 30.f;
+    if (maxTipDist < minHandSpan) return false;
+    return true;  // 5 指全部收拢 = 握拳
+}
+
 // --------------------------- 状态机主循环 ---------------------------
 GestureEvent GestureFSM::handleFrame(const HandKeypoints& kpRaw, double dtMs) {
     if (dtMs <= 0) dtMs = 1.0;
@@ -186,10 +207,10 @@ GestureEvent GestureFSM::handleFrame(const HandKeypoints& kpRaw, double dtMs) {
     if (!kp.valid || kp.points.size() < kHandKeypointCount || lowConfidence) {
         m_holdMs = 0;
         GestureEvent lostEvent = GestureEvent::kNone;
-        if (m_dragging || m_bending) {
+        if (m_dragging || m_fisting) {
             m_dragging = false;
-            m_bending = false;
-            m_bendHoldMs = 0;
+            m_fisting = false;
+            m_fistHoldMs = 0;
             lostEvent = GestureEvent::kDragEnd;
             std::printf("[FSM] 手丢失，拖拽强制结束\n");
         }
@@ -222,7 +243,7 @@ GestureEvent GestureFSM::handleFrame(const HandKeypoints& kpRaw, double dtMs) {
             break;
 
         case CtrlState::kLocked:
-            // LOCKED 态：开掌解锁 / 食指弯曲控制（定位/单击/拖拽）
+            // LOCKED 态：开掌解锁 / 握拳控制（单击/拖拽）+ 食指伸出（移动）
             if (detectOpenPalm(kp)) {
                 // ---- 开掌：累计长按解锁 ----
                 m_holdMs += static_cast<int>(dtMs);
@@ -230,8 +251,8 @@ GestureEvent GestureFSM::handleFrame(const HandKeypoints& kpRaw, double dtMs) {
                     m_state = CtrlState::kIdle;
                     m_holdMs = 0;
                     m_cooldownMs = m_cfg.stateCooldownMs;
-                    m_bending = false;
-                    m_bendHoldMs = 0;
+                    m_fisting = false;
+                    m_fistHoldMs = 0;
                     m_dragging = false;
                     event = GestureEvent::kOpenPalmHold;
                     std::printf("[FSM] 状态迁移：LOCKED → IDLE（已解锁）\n");
@@ -239,60 +260,52 @@ GestureEvent GestureFSM::handleFrame(const HandKeypoints& kpRaw, double dtMs) {
                 break;  // 开掌期间不响应定位/点击
             }
 
-            // ---- 非开掌：食指弯曲控制 ----
-            // 记录平滑后食指尖（点8）坐标供上层绝对定位
-            m_smoothTipX = kp.points[8].x;
-            m_smoothTipY = kp.points[8].y;
+            // ---- 非开掌：握拳控制（点击/拖拽）或食指伸出（移动） ----
+            // 记录平滑后掌心（点9，中指根）坐标供上层做相对位移
+            // （掌心在手部中央，握拳时也可用；食指尖握拳时收拢不可用）
+            m_smoothPalmX = kp.points[9].x;
+            m_smoothPalmY = kp.points[9].y;
 
-            // 食指弯曲比值 = 食指尖(8)到食指根(5) 距离 / 食指根(5)到手腕(0) 距离
-            // 用"食指自身折叠程度"判定：伸直时比值 ≈1.0~1.5，弯曲点击时食指尖折向
-            // 掌心、比值骤降。与手平移完全正交（平移时食指形态不变），且手指并拢
-            // （其他手指靠近食指）时食指仍伸直、比值不变 → 不会误判为弯曲。
-            // 注：比值法对"手指朝屏幕"的投影缩短鲁棒（分子分母同缩）。
-            float tipToRoot = distance(kp.points[8].x, kp.points[8].y,
-                                       kp.points[5].x, kp.points[5].y);
-            float rootToWrist = distance(kp.points[5].x, kp.points[5].y,
-                                         kp.points[0].x, kp.points[0].y);
-            float bendRatio = (rootToWrist > 1e-6f) ? (tipToRoot / rootToWrist) : 1.f;
-            bool bent = (bendRatio < m_cfg.bendRatio);
+            // 握拳判定：5 指尖到手腕距离均 < 阈值（与"食指伸出"天然互斥）
+            bool fisted = detectFist(kp);
 
-            if (!m_bending && !m_dragging) {
-                // ---- 空闲：检测弯曲（点击/拖拽的开始动作）----
-                if (bent) {
-                    m_bending = true;
-                    m_bendHoldMs = 0;
-                    std::printf("[FSM] 弯曲开始（比值=%.2f）\n", bendRatio);
+            if (!m_fisting && !m_dragging) {
+                // ---- 空闲：检测握拳（点击/拖拽的开始动作）----
+                if (fisted) {
+                    m_fisting = true;
+                    m_fistHoldMs = 0;
+                    std::printf("[FSM] 握拳开始\n");
                 } else {
-                    event = GestureEvent::kPointerMove;  // 伸直：相对位移移动
+                    event = GestureEvent::kPointerMove;  // 非握拳（食指伸出）：相对位移移动
                 }
             } else if (m_dragging) {
-                // ---- 拖拽中：检测伸直结束 ----
-                if (!bent) {
+                // ---- 拖拽中：检测松开结束 ----
+                if (!fisted) {
                     m_dragging = false;
-                    m_bending = false;
-                    m_bendHoldMs = 0;
+                    m_fisting = false;
+                    m_fistHoldMs = 0;
                     event = GestureEvent::kDragEnd;
-                    std::printf("[FSM] 拖拽结束（食指伸直）\n");
+                    std::printf("[FSM] 拖拽结束（松开握拳）\n");
                 } else {
                     event = GestureEvent::kDragMove;  // 拖拽移动：跟手
                 }
             } else {
-                // ---- 弯曲判定中：区分单击与拖拽 ----
-                m_bendHoldMs += static_cast<int>(dtMs);
-                if (!bent) {
-                    // 伸直且未达拖拽阈值：单击
-                    m_bending = false;
-                    m_bendHoldMs = 0;
+                // ---- 握拳判定中：区分单击与拖拽 ----
+                m_fistHoldMs += static_cast<int>(dtMs);
+                if (!fisted) {
+                    // 松开且未达拖拽阈值：单击
+                    m_fisting = false;
+                    m_fistHoldMs = 0;
                     event = GestureEvent::kClick;
-                    std::printf("[FSM] 单击（弯曲 %dms）\n", m_bendHoldMs);
-                } else if (m_bendHoldMs >= m_cfg.bendHoldMs) {
-                    // 弯曲保持超时：进入拖拽
+                    std::printf("[FSM] 单击（握拳 %dms）\n", m_fistHoldMs);
+                } else if (m_fistHoldMs >= m_cfg.fistHoldMs) {
+                    // 握拳保持超时：进入拖拽
                     m_dragging = true;
-                    m_bending = false;
+                    m_fisting = false;
                     event = GestureEvent::kDragStart;
-                    std::printf("[FSM] 拖拽开始（弯曲 %dms）\n", m_bendHoldMs);
+                    std::printf("[FSM] 拖拽开始（握拳 %dms）\n", m_fistHoldMs);
                 }
-                // 其余情况：弯曲中尚未定性，等待（不发移动，避免误动）
+                // 其余情况：握拳中尚未定性，等待（不发移动，避免误动）
             }
             break;
     }
@@ -309,9 +322,9 @@ const char* GestureFSM::currentStateName() const {
     return "UNKNOWN";
 }
 
-void GestureFSM::lastIndexTip(float& x, float& y) const {
-    x = m_smoothTipX;
-    y = m_smoothTipY;
+void GestureFSM::lastPalmPoint(float& x, float& y) const {
+    x = m_smoothPalmX;
+    y = m_smoothPalmY;
 }
 
 } // namespace hand_ctrl
