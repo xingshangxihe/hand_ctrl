@@ -1,25 +1,25 @@
 #pragma once
 // ============================================================================
 // gesture_fsm/gesture_fsm.h
-// 作用：手势有限状态机（v2.1 捏合控制方案核心模块）。
+// 作用：手势有限状态机（v2.2 食指弯曲控制方案核心模块）。
 //
-// v2.1 交互模型（点击/移动完全正交，杜绝误判）：
+// v2.2 交互模型（点击/移动完全正交，杜绝误判）：
 //   IDLE       空闲态：唯一手势 = 开掌长按锁定
 //     └─开掌持续≥lock_hold_ms──→ LOCKED
 //   LOCKED     锁定运行态：
 //     ├─ 开掌长按≥lock_hold_ms──→ IDLE（解锁）
-//     ├─ 拇指食指张开（未捏合）──→ 每帧 kPointerMove（食指尖绝对定位鼠标）
-//     ├─ 快速捏合→松开 ──→ kClick（左键单击）
-//     ├─ 捏合保持 ≥pinch_hold_ms ──→ kDragStart（拖拽开始，左键按住）
+//     ├─ 食指伸直（未弯曲）──→ 每帧 kPointerMove（食指尖绝对定位鼠标）
+//     ├─ 快速弯曲→伸直 ──→ kClick（左键单击）
+//     ├─ 弯曲保持 ≥bend_hold_ms ──→ kDragStart（拖拽开始，左键按住）
 //     ├─ 拖拽中移动 ──→ kDragMove（左键保持 + 跟手）
-//     └─ 松开捏合 ──→ kDragEnd（拖拽结束，释放左键）
+//     └─ 伸直 ──→ kDragEnd（拖拽结束，释放左键）
 //
-// 为何用"捏合"而不是"下点"（v2.0 方案的问题）：
-//   1. v2.0 用食指尖 y 方向速度判定"下点"，与移动天然冲突——
-//      手指移动时本身就有 y 分量，极易误触发点击/拖拽。
-//   2. 捏合判定用"拇指尖(4)与食指尖(8)的距离"，与手平移完全正交：
-//      平移时捏合状态不变，移动永不误触发点击。
-//   3. 捏合距离对"手指朝屏幕"的投影缩短鲁棒（两指尖相对位置不变）。
+// 为何用"食指弯曲"而不是"捏合"（v2.1 方案的问题）：
+//   1. 捏合（拇指+食指闭合）动作不自然，长时间操作累。
+//   2. 食指弯曲判定用"食指尖(8)到中指根(9)的距离"——伸直时距离大，
+//      弯曲点击时食指尖折向中指根、距离骤减。与手平移完全正交：
+//      平移时两指相对位置不变，移动永不误触发点击。
+//   3. 弯曲动作类似按鼠标键，直觉自然，学习成本最低。
 //
 // 事件输出：
 //   kOpenPalmHold 开掌长按锁定/解锁开关（无 uinput 输出，仅状态切换）
@@ -52,15 +52,15 @@ enum class CtrlState {
     kLocked = 1,   // 锁定运行：响应单指控制（定位/点击/拖拽）
 };
 
-// 手势事件枚举：状态机对外输出的识别结果（v2.1 捏合方案）
+// 手势事件枚举：状态机对外输出的识别结果（v2.2 食指弯曲方案）
 enum class GestureEvent {
     kNone         = 0,   // 无动作
     kOpenPalmHold = 1,   // 开掌长按：锁定/解锁开关（≥lock_hold_ms）
-    kPointerMove  = 2,   // 食指尖定位移动（LOCKED 态未捏合时每帧上报）
-    kClick        = 3,   // 快速捏合→松开：左键单击
-    kDragStart    = 4,   // 捏合保持（超 pinch_hold_ms）：拖拽开始
+    kPointerMove  = 2,   // 食指尖定位移动（LOCKED 态食指伸直时每帧上报）
+    kClick        = 3,   // 快速弯曲→伸直：左键单击
+    kDragStart    = 4,   // 弯曲保持（超 bend_hold_ms）：拖拽开始
     kDragMove     = 5,   // 拖拽中移动（左键保持按下）
-    kDragEnd      = 6,   // 松开捏合：拖拽结束（释放左键）
+    kDragEnd      = 6,   // 伸直：拖拽结束（释放左键）
 };
 
 // JSON 配置参数集合（运行时加载，所有阈值外置）
@@ -79,12 +79,13 @@ struct FsmConfig {
                                         // 视为该手指伸直。5 指全部伸直 = 开掌。
                                         // 拇指阈值自动放宽（×0.8），因其根紧邻手腕比值天然小
 
-    // 捏合判定（点击/拖拽动作，v2.1 核心）
-    float pinchDistThresholdPx = 40.f;  // 捏合距离阈值（像素）：拇指尖(4)与食指尖(8)距离 < 此值 = 捏合
-    int   pinchHoldMs = 350;            // 捏合保持时长阈值（毫秒）：保持超过 = 拖拽开始；之前松开 = 单击
+    // 食指弯曲判定（点击/拖拽动作，v2.2 核心）
+    float bendDistThresholdPx = 50.f;   // 弯曲距离阈值（像素）：食指尖(8)到中指根(9)距离 < 此值 = 食指弯曲
+    int   bendHoldMs = 350;             // 弯曲保持时长阈值（毫秒）：保持超过 = 拖拽开始；之前伸直 = 单击
 
-    // 鼠标绝对定位灵敏度
-    float mouseSensitivity = 1.5f;      // 目标位移 × 系数 = 实际注入位移（>1 更灵敏）
+    // 鼠标绝对定位映射缩放（各方向独立，解决覆盖范围不足）
+    float mapScaleX = 1.0f;             // 水平缩放系数：屏幕X = 指尖X/画面宽×屏幕宽×系数
+    float mapScaleY = 1.0f;             // 垂直缩放系数：屏幕Y = 指尖Y/画面高×屏幕高×系数
 
     // 图像尺寸（用于坐标映射比例计算）
     int   imageWidth  = 640;
@@ -129,8 +130,9 @@ public:
     int imageWidth() const  { return m_cfg.imageWidth; }
     int imageHeight() const { return m_cfg.imageHeight; }
 
-    // 获取鼠标定位灵敏度系数
-    float mouseSensitivity() const { return m_cfg.mouseSensitivity; }
+    // 获取鼠标绝对定位映射缩放系数（各方向独立）
+    float mapScaleX() const { return m_cfg.mapScaleX; }
+    float mapScaleY() const { return m_cfg.mapScaleY; }
 
 private:
     // --------------------------- 状态成员 ---------------------------
@@ -138,9 +140,9 @@ private:
     int       m_holdMs = 0;                 // 开掌（锁定手势）持续累计时长（毫秒）
     int       m_cooldownMs = 0;             // 状态切换防抖冷却计时器（毫秒）
 
-    // 捏合/拖拽检测状态（v2.1 核心）
-    bool  m_pinching = false;               // 是否处于捏合中（等待区分单击/拖拽）
-    int   m_pinchHoldMs = 0;                // 捏合持续累计时长（毫秒）
+    // 食指弯曲/拖拽检测状态（v2.2 核心）
+    bool  m_bending = false;                // 是否处于弯曲中（等待区分单击/拖拽）
+    int   m_bendHoldMs = 0;                 // 弯曲持续累计时长（毫秒）
     bool  m_dragging = false;               // 是否正在拖拽（左键按住中）
     float m_smoothTipX = -1.f;              // 平滑后食指尖 X（供上层绝对定位）
     float m_smoothTipY = -1.f;              // 平滑后食指尖 Y

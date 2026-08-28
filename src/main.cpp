@@ -7,10 +7,10 @@
 //   推理线程:   从帧队列取帧 → ONNXInfer::infer → 关键点队列
 //   主线程  :   从关键点队列取 → GestureFSM::handleFrame → UInputManager 输出
 //
-// v2.1 交互模型（捏合控制）：
-//   开掌1.2s = 锁定/解锁
-//   锁定后：拇指食指张开 → 食指尖绝对定位鼠标
-//   快速捏合→松开 = 单击；捏合保持 = 拖拽（移动跟手，松开释放）
+// v2.2 交互模型（食指弯曲控制）：
+//   开掌1s = 锁定/解锁
+//   锁定后：食指伸直 → 食指尖绝对定位鼠标
+//   食指快速弯曲→伸直 = 单击；弯曲保持 = 拖拽（移动跟手，伸直释放）
 //
 // 绝对定位实现要点：
 //   uinput 是相对位移设备，需软件维护"虚拟鼠标位置"：
@@ -296,6 +296,9 @@ int main(int argc, char* argv[]) {
     const int scrH = fsm.screenHeight();
     const int imgW = fsm.imageWidth();
     const int imgH = fsm.imageHeight();
+    // 绝对定位映射缩放系数（各方向独立，解决"某方向覆盖范围不足"）
+    const float scaleX = fsm.mapScaleX();
+    const float scaleY = fsm.mapScaleY();
     float virtualMouseX = scrW / 2.f;   // 虚拟鼠标当前位置（屏幕坐标）
     float virtualMouseY = scrH / 2.f;
     bool  virtualInit = false;          // 锁定后首帧需初始化虚拟位置
@@ -498,8 +501,11 @@ int main(int argc, char* argv[]) {
                         break;
                     }
                     // 画面坐标 → 屏幕坐标等比映射（绝对定位：手指位置 = 屏幕位置）
-                    float targetX = smTipX / imgW * scrW;
-                    float targetY = smTipY / imgH * scrH;
+                    // 各方向乘以独立缩放系数：scaleX/scaleY >1 时该方向覆盖行程放大，
+                    // 解决"向上移动覆盖不了整个范围"（手抬手物理行程有限）。
+                    // 注意：映射后需 clamp 到屏幕范围（下面已有边界限制）。
+                    float targetX = smTipX / imgW * scrW * scaleX;
+                    float targetY = smTipY / imgH * scrH * scaleY;
                     // 首帧校准：以当前虚拟位置为基准，避免首帧跳变
                     if (!virtualInit) {
                         virtualMouseX = targetX;
@@ -587,7 +593,7 @@ static const char* eventToString(GestureEvent e) {
         case GestureEvent::kNone:        return "无";
         case GestureEvent::kOpenPalmHold: return "开掌长按(锁定/解锁)";
         case GestureEvent::kPointerMove: return "食指定位移动";
-        case GestureEvent::kClick:       return "捏合点击(左键)";
+        case GestureEvent::kClick:       return "食指点击(左键)";
         case GestureEvent::kDragStart:   return "拖拽开始";
         case GestureEvent::kDragMove:    return "拖拽移动";
         case GestureEvent::kDragEnd:     return "拖拽结束";

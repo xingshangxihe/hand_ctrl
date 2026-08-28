@@ -1,17 +1,17 @@
 // ============================================================================
 // gesture_fsm/gesture_fsm.cpp
-// 作用：GestureFSM 类实现（v2.1 捏合控制方案核心模块）。
+// 作用：GestureFSM 类实现（v2.2 食指弯曲控制方案核心模块）。
 // 职责：
 //   1. 加载 JSON 配置（所有阈值外置）
 //   2. 对 21 关键点做卡尔曼平滑
-//   3. 依据 v2.1 状态机输出事件：开掌锁定/解锁、捏合单击/拖拽、食指尖定位
+//   3. 依据 v2.2 状态机输出事件：开掌锁定/解锁、食指弯曲单击/拖拽、食指尖定位
 //
-// v2.1 捏合检测原理：
-//   点击动作 = "拇指+食指捏合"，与移动（手平移）完全正交：
-//   - 捏合距离 = 拇指尖(4)与食指尖(8)的欧式距离
-//   - 距离 < pinchDistThresholdPx → 捏合（按下）
-//   - 捏合保持超过 pinchHoldMs → 拖拽；在保持期内松开 → 单击
-//   - 平移手时捏合状态不变，移动永不误触发点击
+// v2.2 食指弯曲检测原理：
+//   点击动作 = "食指弯曲"（食指尖折向中指根），与移动（手平移）完全正交：
+//   - 弯曲距离 = 食指尖(8)到中指根(9)的欧式距离
+//   - 距离 < bendDistThresholdPx → 弯曲（按下）
+//   - 弯曲保持超过 bendHoldMs → 拖拽；在保持期内伸直 → 单击
+//   - 平移手时两指相对位置不变，移动永不误触发点击
 // ============================================================================
 
 #include "gesture_fsm/gesture_fsm.h"
@@ -72,9 +72,10 @@ bool GestureFSM::loadConfig(const std::string& configPath) {
     jsonGetFloat(json, "process_noise",         m_cfg.kalmanProcessNoise);
     jsonGetFloat(json, "measure_noise",         m_cfg.kalmanMeasureNoise);
     jsonGetFloat(json, "extension_ratio",              m_cfg.openPalmRatio);
-    jsonGetFloat(json, "pinch_distance_threshold_px", m_cfg.pinchDistThresholdPx);
-    jsonGetInt  (json, "pinch_hold_ms",               m_cfg.pinchHoldMs);
-    jsonGetFloat(json, "sensitivity",                 m_cfg.mouseSensitivity);
+    jsonGetFloat(json, "bend_dist_threshold_px",       m_cfg.bendDistThresholdPx);
+    jsonGetInt  (json, "bend_hold_ms",                m_cfg.bendHoldMs);
+    jsonGetFloat(json, "scale_x",                      m_cfg.mapScaleX);
+    jsonGetFloat(json, "scale_y",                      m_cfg.mapScaleY);
     jsonGetInt  (json, "width",                       m_cfg.imageWidth);
     jsonGetInt  (json, "height",                      m_cfg.imageHeight);
     jsonGetInt  (json, "screen_width",                m_cfg.screenWidth);
@@ -86,10 +87,10 @@ bool GestureFSM::loadConfig(const std::string& configPath) {
     }
 
     m_cfgLoaded = true;
-    std::printf("[GestureFSM] 配置加载成功(v2.1): %s\n", configPath.c_str());
-    std::printf("[GestureFSM] 锁定阈值=%dms 屏幕=%dx%d 捏合距离=%.0fpx 灵敏度=%.2f\n",
+    std::printf("[GestureFSM] 配置加载成功(v2.2): %s\n", configPath.c_str());
+    std::printf("[GestureFSM] 锁定阈值=%dms 屏幕=%dx%d 弯曲距离=%.0fpx 缩放=%.2fx%.2f\n",
                 m_cfg.lockHoldMs, m_cfg.screenWidth, m_cfg.screenHeight,
-                m_cfg.pinchDistThresholdPx, m_cfg.mouseSensitivity);
+                m_cfg.bendDistThresholdPx, m_cfg.mapScaleX, m_cfg.mapScaleY);
     return true;
 }
 
@@ -184,10 +185,10 @@ GestureEvent GestureFSM::handleFrame(const HandKeypoints& kpRaw, double dtMs) {
     if (!kp.valid || kp.points.size() < kHandKeypointCount || lowConfidence) {
         m_holdMs = 0;
         GestureEvent lostEvent = GestureEvent::kNone;
-        if (m_dragging || m_pinching) {
+        if (m_dragging || m_bending) {
             m_dragging = false;
-            m_pinching = false;
-            m_pinchHoldMs = 0;
+            m_bending = false;
+            m_bendHoldMs = 0;
             lostEvent = GestureEvent::kDragEnd;
             std::printf("[FSM] 手丢失，拖拽强制结束\n");
         }
@@ -220,7 +221,7 @@ GestureEvent GestureFSM::handleFrame(const HandKeypoints& kpRaw, double dtMs) {
             break;
 
         case CtrlState::kLocked:
-            // LOCKED 态：开掌解锁 / 捏合控制（定位/单击/拖拽）
+            // LOCKED 态：开掌解锁 / 食指弯曲控制（定位/单击/拖拽）
             if (detectOpenPalm(kp)) {
                 // ---- 开掌：累计长按解锁 ----
                 m_holdMs += static_cast<int>(dtMs);
@@ -228,8 +229,8 @@ GestureEvent GestureFSM::handleFrame(const HandKeypoints& kpRaw, double dtMs) {
                     m_state = CtrlState::kIdle;
                     m_holdMs = 0;
                     m_cooldownMs = m_cfg.stateCooldownMs;
-                    m_pinching = false;
-                    m_pinchHoldMs = 0;
+                    m_bending = false;
+                    m_bendHoldMs = 0;
                     m_dragging = false;
                     event = GestureEvent::kOpenPalmHold;
                     std::printf("[FSM] 状态迁移：LOCKED → IDLE（已解锁）\n");
@@ -237,53 +238,55 @@ GestureEvent GestureFSM::handleFrame(const HandKeypoints& kpRaw, double dtMs) {
                 break;  // 开掌期间不响应定位/点击
             }
 
-            // ---- 非开掌：捏合控制 ----
+            // ---- 非开掌：食指弯曲控制 ----
             // 记录平滑后食指尖（点8）坐标供上层绝对定位
             m_smoothTipX = kp.points[8].x;
             m_smoothTipY = kp.points[8].y;
 
-            // 捏合距离 = 拇指尖(4)与食指尖(8)的欧式距离
-            float pinchDist = distance(kp.points[4].x, kp.points[4].y,
-                                       kp.points[8].x, kp.points[8].y);
-            bool pinched = (pinchDist < m_cfg.pinchDistThresholdPx);
+            // 食指弯曲距离 = 食指尖(8)到中指根(9)的欧式距离
+            // 伸直时两指分开（距离大），弯曲点击时食指尖折向中指根（距离骤减）。
+            // 与手平移完全正交：平移时两指相对位置不变，移动永不误触发点击。
+            float bendDist = distance(kp.points[8].x, kp.points[8].y,
+                                      kp.points[9].x, kp.points[9].y);
+            bool bent = (bendDist < m_cfg.bendDistThresholdPx);
 
-            if (!m_pinching && !m_dragging) {
-                // ---- 空闲：检测捏合（点击/拖拽的开始动作）----
-                if (pinched) {
-                    m_pinching = true;
-                    m_pinchHoldMs = 0;
-                    std::printf("[FSM] 捏合开始（距离=%.0fpx）\n", pinchDist);
+            if (!m_bending && !m_dragging) {
+                // ---- 空闲：检测弯曲（点击/拖拽的开始动作）----
+                if (bent) {
+                    m_bending = true;
+                    m_bendHoldMs = 0;
+                    std::printf("[FSM] 弯曲开始（距离=%.0fpx）\n", bendDist);
                 } else {
-                    event = GestureEvent::kPointerMove;  // 未捏合：绝对定位移动
+                    event = GestureEvent::kPointerMove;  // 伸直：绝对定位移动
                 }
             } else if (m_dragging) {
-                // ---- 拖拽中：检测松开结束 ----
-                if (!pinched) {
+                // ---- 拖拽中：检测伸直结束 ----
+                if (!bent) {
                     m_dragging = false;
-                    m_pinching = false;
-                    m_pinchHoldMs = 0;
+                    m_bending = false;
+                    m_bendHoldMs = 0;
                     event = GestureEvent::kDragEnd;
-                    std::printf("[FSM] 拖拽结束（松开捏合）\n");
+                    std::printf("[FSM] 拖拽结束（食指伸直）\n");
                 } else {
                     event = GestureEvent::kDragMove;  // 拖拽移动：跟手
                 }
             } else {
-                // ---- 捏合判定中：区分单击与拖拽 ----
-                m_pinchHoldMs += static_cast<int>(dtMs);
-                if (!pinched) {
-                    // 松开且未达拖拽阈值：单击
-                    m_pinching = false;
-                    m_pinchHoldMs = 0;
+                // ---- 弯曲判定中：区分单击与拖拽 ----
+                m_bendHoldMs += static_cast<int>(dtMs);
+                if (!bent) {
+                    // 伸直且未达拖拽阈值：单击
+                    m_bending = false;
+                    m_bendHoldMs = 0;
                     event = GestureEvent::kClick;
-                    std::printf("[FSM] 单击（捏合 %dms）\n", m_pinchHoldMs);
-                } else if (m_pinchHoldMs >= m_cfg.pinchHoldMs) {
-                    // 捏合保持超时：进入拖拽
+                    std::printf("[FSM] 单击（弯曲 %dms）\n", m_bendHoldMs);
+                } else if (m_bendHoldMs >= m_cfg.bendHoldMs) {
+                    // 弯曲保持超时：进入拖拽
                     m_dragging = true;
-                    m_pinching = false;
+                    m_bending = false;
                     event = GestureEvent::kDragStart;
-                    std::printf("[FSM] 拖拽开始（捏合 %dms）\n", m_pinchHoldMs);
+                    std::printf("[FSM] 拖拽开始（弯曲 %dms）\n", m_bendHoldMs);
                 }
-                // 其余情况：捏合中尚未定性，等待（不发移动，避免误动）
+                // 其余情况：弯曲中尚未定性，等待（不发移动，避免误动）
             }
             break;
     }
