@@ -208,6 +208,13 @@ int main(int argc, char* argv[]) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(300));
                 if (camera.open(deviceIndex)) {
                     std::printf("[capture] 摄像头重开成功\n");
+                    // 丢弃启动期坏帧：VMware 虚拟摄像头重开后流刚建立，
+                    // 前几帧可能是花屏/损坏帧（imdecode 能解出但内容错乱），
+                    // 直接丢弃，避免污染帧队列与 palm 检测。
+                    for (int warm = 0; warm < 10; ++warm) {
+                        cv::Mat warmFrame;
+                        if (!camera.readFrame(warmFrame)) break;
+                    }
                 } else {
                     std::fprintf(stderr, "[capture] 摄像头重开失败\n");
                 }
@@ -330,15 +337,18 @@ int main(int argc, char* argv[]) {
     float smPalmY = -1.f;
     float lastSmPalmX = -1.f;           // 上一帧平滑坐标（用于计算帧间位移）
     float lastSmPalmY = -1.f;
-    // 拖拽期间隐藏画面窗口标志：拖拽时虚拟鼠标按住左键+移动，
-    // 若指针落在画面窗口上会触发 GTK 窗口交互（拖动/点击），导致画面消失。
-    // 方案：拖拽开始销毁窗口，结束立即重建，彻底避免冲突。
     long long lastWatchdogUs = 0;  // 看门狗上次检查时间戳（独立计时，不依赖帧数）
+    long long lastValidKpUs = 0;   // 最近一次有效关键点的时间戳（检测"花屏但出帧"用）
     while (!g_shouldExit.load()) {
         // ---- 摄像头看门狗（放在循环最前，不依赖关键点队列！）----
         // 背景：摄像头花屏/MJPG 解码持续失败时，g_lastFrameUs 不更新（无新帧），
         //       必须强制重开摄像头恢复。若放在 FSM 推进后，帧队列空时主循环
         //       会 continue 跳过它 → 看门狗永不执行。故独立放置于此。
+        // 检测两类异常：
+        //   A) 无新帧：g_lastFrameUs 停止更新（断流/卡死）→ 重开
+        //   B) 花屏但出帧：MJPG 能解码但画面花屏/冻结，palm 持续检测不到手，
+        //      g_lastFrameUs 仍在更新（有帧到达），但 lastValidKpUs 长期不更新
+        //      （画面里一直识别不到手）→ 也重开。此为 VMware 摄像头常见故障。
         {
             long long nowUs = std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -349,15 +359,30 @@ int main(int argc, char* argv[]) {
             if (nowUs - lastWatchdogUs >= 1'000'000LL) {
                 lastWatchdogUs = nowUs;
                 long long lastUs = g_lastFrameUs.load();
+                bool needRestart = false;
+                const char* reason = nullptr;
                 if (lastUs > 0 && (nowUs - lastUs) > 3'000'000LL) {
+                    // 情况 A：摄像头 3 秒无新帧（断流/采集线程卡死）
+                    needRestart = true;
+                    reason = "无新帧";
+                } else if (lastUs > 0 && lastValidKpUs > 0 &&
+                           (nowUs - lastValidKpUs) > 8'000'000LL) {
+                    // 情况 B：有帧持续到达但 palm 超过 8 秒检测不到手——
+                    // 正常操作时手即使短暂移出画面也会很快回来，8 秒无有效
+                    // 关键点基本可断定画面花屏/冻结（VMware 虚拟摄像头常见）。
+                    // 注意 lastValidKpUs>0 排除启动时手尚未放入画面的情况。
+                    needRestart = true;
+                    reason = "画面花屏(palm持续无效)";
+                }
+                if (needRestart) {
                     // 冷却：上次请求在 10 秒内不再重复发（避免摄像头彻底损坏时无限刷屏）
                     static long long lastRequestUs = 0;
                     if (lastRequestUs > 0 && (nowUs - lastRequestUs) < 10'000'000LL) {
                         // 静默等待，不做动作
                     } else {
                         lastRequestUs = nowUs;
-                        std::printf("[main] 看门狗：摄像头 %lld 秒无新帧，请求重开...\n",
-                                    (nowUs - lastUs) / 1000000);
+                        std::printf("[main] 看门狗：摄像头异常(%s %lld 秒)，请求重开...\n",
+                                    reason, (nowUs - lastUs) / 1000000);
                         // 关键：只设置标志，由采集线程独占执行 release/open，
                         // 避免两个线程并发操作摄像头设备导致 EBUSY 无法恢复。
                         g_cameraRestartRequested.store(true);
@@ -468,6 +493,12 @@ int main(int argc, char* argv[]) {
         // 手丢失/无效时重置位移参考点（手重新出现时不产生瞬移）
         if (!kp.valid || kp.points.size() < 21) {
             smPalmX = smPalmY = lastSmPalmX = lastSmPalmY = -1.f;
+        }
+
+        // 记录最近一次有效关键点时间（看门狗检测"花屏但出帧"用）
+        if (kp.valid && kp.points.size() >= 21) {
+            lastValidKpUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
         }
 
         // FSM 推进

@@ -141,6 +141,10 @@ struct Camera::Impl {
             return false;
         }
 
+        // 重开成功后重置错误日志计数，避免上一次损坏期间的失败日志
+        // 把本次重新打开后的真实失败掩盖掉（否则限流后看不到诊断信息）
+        m_errLogCount = 0;
+
         std::printf("[Camera] 摄像头打开成功：设备索引=%d，实际分辨率=%dx%d，帧率=%d\n",
                     m_deviceIndex, m_width, m_height, m_fps);
         return true;
