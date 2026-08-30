@@ -73,7 +73,7 @@ bool GestureFSM::loadConfig(const std::string& configPath) {
     jsonGetFloat(json, "process_noise",         m_cfg.kalmanProcessNoise);
     jsonGetFloat(json, "measure_noise",         m_cfg.kalmanMeasureNoise);
     jsonGetFloat(json, "extension_ratio",              m_cfg.openPalmRatio);
-    jsonGetFloat(json, "pinch_dist_threshold_px",      m_cfg.pinchDistThresholdPx);
+    jsonGetFloat(json, "pinch_ratio",                  m_cfg.pinchRatio);
     jsonGetInt  (json, "fold_distance_threshold_px",   m_cfg.dragFoldDistPx);
     jsonGetFloat(json, "gain_x",                       m_cfg.mouseGainX);
     jsonGetFloat(json, "gain_y",                       m_cfg.mouseGainY);
@@ -88,10 +88,10 @@ bool GestureFSM::loadConfig(const std::string& configPath) {
     }
 
     m_cfgLoaded = true;
-    std::printf("[GestureFSM] 配置加载成功(v2.5): %s\n", configPath.c_str());
-    std::printf("[GestureFSM] 锁定阈值=%dms 屏幕=%dx%d 捏合距离=%.0fpx 双指V折叠=%dpx 增益=%.2fx%.2f\n",
+    std::printf("[GestureFSM] 配置加载成功(v2.5.1): %s\n", configPath.c_str());
+    std::printf("[GestureFSM] 锁定阈值=%dms 屏幕=%dx%d 捏合比例=%.2f 双指V折叠=%dpx 增益=%.2fx%.2f\n",
                 m_cfg.lockHoldMs, m_cfg.screenWidth, m_cfg.screenHeight,
-                m_cfg.pinchDistThresholdPx, m_cfg.dragFoldDistPx,
+                m_cfg.pinchRatio, m_cfg.dragFoldDistPx,
                 m_cfg.mouseGainX, m_cfg.mouseGainY);
     return true;
 }
@@ -270,10 +270,21 @@ GestureEvent GestureFSM::handleFrame(const HandKeypoints& kpRaw, double dtMs) {
             m_smoothPalmX = kp.points[9].x;
             m_smoothPalmY = kp.points[9].y;
 
-            // 单击判定：捏合 = 拇指尖(4)与食指尖(8)距离 < 阈值
+            // 单击判定：捏合 = 拇指尖(4)到食指尖(8)距离 / 中指根(9)到手腕(0)距离 < 阈值
+            // 用比例而非绝对像素：手离摄像头远近不影响判定（远处手小、距离等比缩小）
             float pinchDist = distance(kp.points[4].x, kp.points[4].y,
                                        kp.points[8].x, kp.points[8].y);
-            bool pinched = (pinchDist < m_cfg.pinchDistThresholdPx);
+            float handSize = distance(kp.points[9].x, kp.points[9].y,
+                                      kp.points[0].x, kp.points[0].y);
+            float pinchRatioNow = (handSize > 1e-6f) ? (pinchDist / handSize) : 1.f;
+            bool pinched = (pinchRatioNow < m_cfg.pinchRatio);
+
+            // 诊断日志：每 60 帧打印捏合比例（帮助调阈值）
+            static int pinchDiagCnt = 0;
+            if (++pinchDiagCnt % 60 == 1) {
+                std::printf("[FSM] 捏合诊断 比例=%.2f (阈值 %.2f) dist=%.0fpx handSize=%.0fpx\n",
+                            pinchRatioNow, m_cfg.pinchRatio, pinchDist, handSize);
+            }
 
             // 拖拽判定：双指V手势（食指+中指伸直、无名指+小指弯曲）
             bool twoFinger = detectTwoFinger(kp);
