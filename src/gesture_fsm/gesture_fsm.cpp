@@ -264,6 +264,15 @@ GestureEvent GestureFSM::handleFrame(const HandKeypoints& kpRaw, double dtMs) {
             float pinchRatioNow = (handSize > 1e-6f) ? (pinchDist / handSize) : 1.f;
             bool pinched = (pinchRatioNow < m_cfg.pinchRatio);
 
+            // 诊断：每 30 帧打印一次当前捏合比例（无论是否触发），
+            // 便于观察捏合动作时的实际比例值，调整 pinch_ratio 阈值。
+            static int pinchDiagCnt = 0;
+            if (++pinchDiagCnt % 30 == 1) {
+                std::printf("[FSM] 捏合比例=%.2f (阈值 %.2f) dist=%.0fpx handSize=%.0fpx%s\n",
+                            pinchRatioNow, m_cfg.pinchRatio, pinchDist, handSize,
+                            pinched ? " → 捏合" : "");
+            }
+
             // 拖拽判定：双指V手势（食指+中指伸直、无名指+小指弯曲）
             bool twoFinger = detectTwoFinger(kp);
 
