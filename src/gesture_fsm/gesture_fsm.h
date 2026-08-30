@@ -91,9 +91,8 @@ struct FsmConfig {
     int   dragFoldDistPx = 130;         // 双指V：无名指(16)/小指(20)到手腕距离 < 此值（弯曲）
                                         // 食指(8)/中指(12)伸直用 openPalmRatio 比值判定
 
-    // 右键判定（拇指+小指捏合，v2.6.1）
-    float rightClickThumbPinkyRatio = 0.6f;  // 拇指尖(4)到小指尖(20)距离 ÷ 中指根(9)到手腕(0)
-                                        // < 此值 = 拇指小指捏合 → 右键。与双指V特征完全不同
+    // 右键判定（食指+小指伸出，v2.6.2）
+    // 判定复用 openPalmRatio（伸直比值）与 dragFoldDistPx（弯曲距离），无需独立阈值
 
     // 鼠标相对位移增益（触控板式，各方向独立）
     float mouseGainX = 2.0f;            // 水平增益：鼠标位移 = 指尖画面位移×(屏幕宽/画面宽)×gain
@@ -180,10 +179,11 @@ private:
     // 无名指(16)+小指(20)弯曲（到手腕距离 < dragFoldDistPx）
     bool detectTwoFinger(const HandKeypoints& kp);
 
-    // 拇指+小指捏合判定（右键手势）：拇指尖(4)到小指尖(20)距离 ÷ 中指根(9)到手腕(0)
-    // < rightClickThumbPinkyRatio。拇指小指在手掌相对两侧，捏合时距离骤减；
-    // 与双指V拖拽（食+中指伸直）的检测特征完全不同，绝不误判
-    bool detectThumbPinky(const HandKeypoints& kp);
+    // 食指+小指伸出判定（右键手势）：食指(8)+小指(20)伸直（比值 > openPalmRatio），
+    // 中指(12)+无名指(16)弯曲（到手腕距离 < dragFoldDistPx）。
+    // 与双指V拖拽（食指+中指伸直、无名指+小指弯曲）的"中指/小指"判据互换 → 完全正交。
+    // 用户在食指左键控制时，只需再伸出小指即可切右键，切换顺滑
+    bool detectIndexPinky(const HandKeypoints& kp);
 
     // 工具：计算两点欧式距离
     static float distance(float x1, float y1, float x2, float y2);

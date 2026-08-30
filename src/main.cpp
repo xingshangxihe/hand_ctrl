@@ -353,7 +353,7 @@ int main(int argc, char* argv[]) {
                     }
                 }
                 // 注意：OpenCV putText 只支持 ASCII（Hershey 矢量字体），中文会乱码，故用英文
-                std::string stateText = std::string("State: ") + fsm.currentStateName() + "  (open palm 1.2s to lock)";
+                std::string stateText = std::string("State: ") + fsm.currentStateName() + "  (open palm 1s to lock)";
                 cv::putText(vis, stateText, cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 255), 2);
                 // 窗口创建：只在首次调用 namedWindow（WINDOW_NORMAL 允许调整大小）。
                 // 关键修复：若每次循环都调用 namedWindow，用户点 × 关闭窗口后，
@@ -594,7 +594,7 @@ static const char* eventToString(GestureEvent e) {
         case GestureEvent::kPointerMove: return "食指定位移动";
         case GestureEvent::kClick:       return "捏合点击(左键)";
         case GestureEvent::kDoubleClick: return "捏合双击(左键)";
-        case GestureEvent::kRightClick:  return "拇指小指捏合(右键)";
+        case GestureEvent::kRightClick:  return "食指小指伸出(右键)";
         case GestureEvent::kDragStart:   return "拖拽开始";
         case GestureEvent::kDragMove:    return "拖拽移动";
         case GestureEvent::kDragEnd:     return "拖拽结束";

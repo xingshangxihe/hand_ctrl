@@ -76,7 +76,6 @@ bool GestureFSM::loadConfig(const std::string& configPath) {
     jsonGetFloat(json, "pinch_ratio",                  m_cfg.pinchRatio);
     jsonGetInt  (json, "double_click_interval_ms",     m_cfg.doubleClickIntervalMs);
     jsonGetInt  (json, "fold_distance_threshold_px",   m_cfg.dragFoldDistPx);
-    jsonGetFloat(json, "thumb_pinky_ratio",            m_cfg.rightClickThumbPinkyRatio);
     jsonGetFloat(json, "gain_x",                       m_cfg.mouseGainX);
     jsonGetFloat(json, "gain_y",                       m_cfg.mouseGainY);
     jsonGetInt  (json, "width",                       m_cfg.imageWidth);
@@ -90,10 +89,10 @@ bool GestureFSM::loadConfig(const std::string& configPath) {
     }
 
     m_cfgLoaded = true;
-    std::printf("[GestureFSM] 配置加载成功(v2.6.1): %s\n", configPath.c_str());
-    std::printf("[GestureFSM] 锁定阈值=%dms 屏幕=%dx%d 捏合比例=%.2f 双指V折叠=%dpx 拇指小指=%.2f 增益=%.2fx%.2f\n",
+    std::printf("[GestureFSM] 配置加载成功(v2.6.2): %s\n", configPath.c_str());
+    std::printf("[GestureFSM] 锁定阈值=%dms 屏幕=%dx%d 捏合比例=%.2f 双指V折叠=%dpx 增益=%.2fx%.2f\n",
                 m_cfg.lockHoldMs, m_cfg.screenWidth, m_cfg.screenHeight,
-                m_cfg.pinchRatio, m_cfg.dragFoldDistPx, m_cfg.rightClickThumbPinkyRatio,
+                m_cfg.pinchRatio, m_cfg.dragFoldDistPx,
                 m_cfg.mouseGainX, m_cfg.mouseGainY);
     return true;
 }
@@ -193,22 +192,31 @@ bool GestureFSM::detectTwoFinger(const HandKeypoints& kp) {
     return true;  // 双指V成立
 }
 
-// --------------------------- 拇指+小指捏合判定（右键手势） ---------------------------
-// 判定：拇指尖(4)到小指尖(20)距离 ÷ 中指根(9)到手腕(0) < rightClickThumbPinkyRatio。
-// 设计：拇指与小指位于手掌相对两侧，正常手型距离大（比例 >1），
-//       捏合（比"六"手势）时距离骤减（比例 <0.6）。
-// 与双指V拖拽（食+中指伸直）的检测特征完全不同——双指V不涉及拇指小指距离，
-// 因此拇指小指捏合绝不会被误判为双指V拖拽（用户反馈三指手势被误判的问题根因）。
-bool GestureFSM::detectThumbPinky(const HandKeypoints& kp) {
+// --------------------------- 食指+小指伸出判定（右键手势） ---------------------------
+// 判定：食指(8)+小指(20)伸直（指尖到手腕/指根到手腕比值 > openPalmRatio），
+//       中指(12)+无名指(16)弯曲（到手腕距离 < dragFoldDistPx）。
+// 与双指V拖拽（食+中指伸直、无名指+小指弯曲）的判据互换：
+//   双指V = 中直+小弯；右键 = 中弯+小直 → 完全正交，绝不误判。
+// 设计动机：用户在食指左键控制（食指伸出）时，只需再伸出小指即切右键，切换顺滑。
+bool GestureFSM::detectIndexPinky(const HandKeypoints& kp) {
     if (kp.points.size() < 21) return false;
     const auto& w = kp.points[0];  // 手腕
 
-    float thumbPinkyDist = distance(kp.points[4].x, kp.points[4].y,
-                                    kp.points[20].x, kp.points[20].y);
-    float handSize = distance(kp.points[9].x, kp.points[9].y,
-                              kp.points[0].x, kp.points[0].y);
-    if (handSize < 1e-6f) return false;
-    return (thumbPinkyDist / handSize < m_cfg.rightClickThumbPinkyRatio);
+    // 食指(8)/小指(20)必须伸直
+    {
+        float tip = distance(kp.points[8].x, kp.points[8].y, w.x, w.y);
+        float root = distance(kp.points[5].x, kp.points[5].y, w.x, w.y);
+        if (root < 1e-6f || tip / root < m_cfg.openPalmRatio) return false;
+    }
+    {
+        float tip = distance(kp.points[20].x, kp.points[20].y, w.x, w.y);
+        float root = distance(kp.points[17].x, kp.points[17].y, w.x, w.y);
+        if (root < 1e-6f || tip / root < m_cfg.openPalmRatio) return false;
+    }
+    // 中指(12)/无名指(16)必须弯曲：到手腕距离 < 阈值
+    if (distance(kp.points[12].x, kp.points[12].y, w.x, w.y) >= m_cfg.dragFoldDistPx) return false;
+    if (distance(kp.points[16].x, kp.points[16].y, w.x, w.y) >= m_cfg.dragFoldDistPx) return false;
+    return true;  // 食指+小指伸出成立
 }
 
 // --------------------------- 状态机主循环 ---------------------------
@@ -301,8 +309,8 @@ GestureEvent GestureFSM::handleFrame(const HandKeypoints& kpRaw, double dtMs) {
 
             // 拖拽判定：双指V手势（食指+中指伸直、无名指+小指弯曲）
             bool twoFinger = detectTwoFinger(kp);
-            // 拇指小指捏合判定（右键）：拇指尖到小指尖距离 / 手尺寸 < 阈值
-            bool thumbPinky = detectThumbPinky(kp);
+            // 食指+小指伸出判定（右键）：食指尖(8)到食指根(5)比值、小指尖(20)到小指根(17)比值
+            bool indexPinky = detectIndexPinky(kp);
 
             // ---- 捏合 tap（最高优先级：单击/双击，边沿触发防连发）----
             if (pinched) {
@@ -327,18 +335,18 @@ GestureEvent GestureFSM::handleFrame(const HandKeypoints& kpRaw, double dtMs) {
             }
             m_pinched = false;  // 解除捏合，允许下次边沿触发
 
-            // ---- 拇指小指捏合右键（边沿触发防连发，与双指V/移动区分）----
-            if (thumbPinky) {
+            // ---- 食指小指伸出右键（边沿触发防连发，与双指V/移动区分）----
+            if (indexPinky) {
                 if (!m_rightClickPending) {
                     m_rightClickPending = true;
-                    m_holdMs = 0;  // 拇指小指捏合中断开掌解锁计时
+                    m_holdMs = 0;  // 食指小指伸出中断开掌解锁计时
                     event = GestureEvent::kRightClick;
-                    std::printf("[FSM] 右键（拇指小指捏合）\n");
+                    std::printf("[FSM] 右键（食指小指伸出）\n");
                 }
-                // 拇指小指捏合保持中：不发移动，避免误动
+                // 食指小指伸出保持中：不发移动，避免误动
                 break;
             }
-            m_rightClickPending = false;  // 解除捏合，允许下次边沿触发
+            m_rightClickPending = false;  // 解除手势，允许下次边沿触发
 
             // ---- 双指V拖拽：显式手势 ----
             if (twoFinger) {
@@ -360,7 +368,7 @@ GestureEvent GestureFSM::handleFrame(const HandKeypoints& kpRaw, double dtMs) {
                 break;
             }
 
-            // ---- 开掌解锁（非捏合、非拇指小指、非双指V时才判定）----
+            // ---- 开掌解锁（非捏合、非食指小指、非双指V时才判定）----
             if (detectOpenPalm(kp)) {
                 m_holdMs += static_cast<int>(dtMs);
                 if (m_holdMs >= m_cfg.lockHoldMs && m_cooldownMs <= 0) {
