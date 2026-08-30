@@ -207,6 +207,21 @@ void UInputManager::clickLeft() {
     emitSync(m_fdMouse);
 }
 
+void UInputManager::doubleClick() {
+    if (m_fdMouse < 0) return;
+    // 双击：两次单击，中间间隔 50ms（模拟真实双击节奏）
+    for (int i = 0; i < 2; ++i) {
+        emitEvent(m_fdMouse, EV_KEY, BTN_LEFT, 1);
+        emitSync(m_fdMouse);
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        emitEvent(m_fdMouse, EV_KEY, BTN_LEFT, 0);
+        emitSync(m_fdMouse);
+        if (i == 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));  // 两次之间间隔
+        }
+    }
+}
+
 void UInputManager::pressLeft() {
     if (m_fdMouse < 0) return;
     // 仅按下（供拖拽使用，由调用方在合适时机调用 releaseLeft）

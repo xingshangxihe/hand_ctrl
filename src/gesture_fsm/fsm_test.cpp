@@ -35,7 +35,9 @@ static const char* eventToString(GestureEvent e) {
         case GestureEvent::kNone:        return "无";
         case GestureEvent::kOpenPalmHold: return "开掌长按(锁定/解锁)";
         case GestureEvent::kPointerMove: return "食指定位移动";
-        case GestureEvent::kClick:       return "食指点击(左键)";
+        case GestureEvent::kClick:       return "捏合点击(左键)";
+        case GestureEvent::kDoubleClick: return "捏合双击(左键)";
+        case GestureEvent::kRightClick:  return "三指(右键)";
         case GestureEvent::kDragStart:   return "拖拽开始";
         case GestureEvent::kDragMove:    return "拖拽移动";
         case GestureEvent::kDragEnd:     return "拖拽结束";
@@ -88,7 +90,7 @@ int main(int argc, char* argv[]) {
     auto lastTime = std::chrono::steady_clock::now();
     auto startTime = lastTime;
     int frameCnt = 0;
-    int eventCnt[7] = {0};  // v2 共 7 个事件（kNone=0 ~ kDragEnd=6）
+    int eventCnt[9] = {0};  // v2.6 共 9 个事件（kNone=0 ~ kDragEnd=8）
 
     while (true) {
         // 信号检测：Ctrl+C 优雅退出
@@ -176,7 +178,7 @@ int main(int argc, char* argv[]) {
     camera.release();
     cv::destroyAllWindows();
     std::printf("[fsm_test] 结束。共 %d 帧，事件统计:\n", frameCnt);
-    for (int i = 1; i <= 6; ++i) {  // kOpenPalmHold(1) ~ kDragEnd(6)
+    for (int i = 1; i <= 8; ++i) {  // kOpenPalmHold(1) ~ kDragEnd(8)
         std::printf("  %-20s: %d 次\n", eventToString(static_cast<GestureEvent>(i)), eventCnt[i]);
     }
     return 0;

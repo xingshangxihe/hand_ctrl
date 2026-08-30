@@ -525,6 +525,14 @@ int main(int argc, char* argv[]) {
                 uinput.clickLeft();  // 左键单击
                 break;
 
+            case GestureEvent::kDoubleClick:
+                uinput.doubleClick();  // 左键双击
+                break;
+
+            case GestureEvent::kRightClick:
+                uinput.clickRight();  // 右键单击
+                break;
+
             case GestureEvent::kDragStart:
                 uinput.pressLeft();  // 拖拽开始：按住左键
                 // 拖拽期间隐藏画面窗口：拖拽时虚拟鼠标按住左键+移动，
@@ -584,7 +592,9 @@ static const char* eventToString(GestureEvent e) {
         case GestureEvent::kNone:        return "无";
         case GestureEvent::kOpenPalmHold: return "开掌长按(锁定/解锁)";
         case GestureEvent::kPointerMove: return "食指定位移动";
-        case GestureEvent::kClick:       return "食指点击(左键)";
+        case GestureEvent::kClick:       return "捏合点击(左键)";
+        case GestureEvent::kDoubleClick: return "捏合双击(左键)";
+        case GestureEvent::kRightClick:  return "三指(右键)";
         case GestureEvent::kDragStart:   return "拖拽开始";
         case GestureEvent::kDragMove:    return "拖拽移动";
         case GestureEvent::kDragEnd:     return "拖拽结束";

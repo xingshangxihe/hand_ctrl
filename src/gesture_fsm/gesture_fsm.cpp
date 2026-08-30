@@ -74,6 +74,7 @@ bool GestureFSM::loadConfig(const std::string& configPath) {
     jsonGetFloat(json, "measure_noise",         m_cfg.kalmanMeasureNoise);
     jsonGetFloat(json, "extension_ratio",              m_cfg.openPalmRatio);
     jsonGetFloat(json, "pinch_ratio",                  m_cfg.pinchRatio);
+    jsonGetInt  (json, "double_click_interval_ms",     m_cfg.doubleClickIntervalMs);
     jsonGetInt  (json, "fold_distance_threshold_px",   m_cfg.dragFoldDistPx);
     jsonGetFloat(json, "gain_x",                       m_cfg.mouseGainX);
     jsonGetFloat(json, "gain_y",                       m_cfg.mouseGainY);
@@ -191,9 +192,41 @@ bool GestureFSM::detectTwoFinger(const HandKeypoints& kp) {
     return true;  // 双指V成立
 }
 
+// --------------------------- 三指判定（右键手势） ---------------------------
+// 判定：食指(8)+中指(12)+无名指(16)伸直（指尖到手腕/指根到手腕比值 > openPalmRatio），
+//       小指(20)弯曲（到手腕距离 < dragFoldDistPx）。
+// 与双指V（只伸 2 指）天然区分：三指多要求无名指伸直。
+bool GestureFSM::detectThreeFinger(const HandKeypoints& kp) {
+    if (kp.points.size() < 21) return false;
+    const auto& w = kp.points[0];  // 手腕
+
+    // 食指(8)/中指(12)/无名指(16)必须伸直
+    {
+        float tip = distance(kp.points[8].x, kp.points[8].y, w.x, w.y);
+        float root = distance(kp.points[5].x, kp.points[5].y, w.x, w.y);
+        if (root < 1e-6f || tip / root < m_cfg.openPalmRatio) return false;
+    }
+    {
+        float tip = distance(kp.points[12].x, kp.points[12].y, w.x, w.y);
+        float root = distance(kp.points[9].x, kp.points[9].y, w.x, w.y);
+        if (root < 1e-6f || tip / root < m_cfg.openPalmRatio) return false;
+    }
+    {
+        float tip = distance(kp.points[16].x, kp.points[16].y, w.x, w.y);
+        float root = distance(kp.points[13].x, kp.points[13].y, w.x, w.y);
+        if (root < 1e-6f || tip / root < m_cfg.openPalmRatio) return false;
+    }
+    // 小指(20)必须弯曲：到手腕距离 < 阈值
+    if (distance(kp.points[20].x, kp.points[20].y, w.x, w.y) >= m_cfg.dragFoldDistPx) return false;
+    return true;  // 三指成立
+}
+
 // --------------------------- 状态机主循环 ---------------------------
 GestureEvent GestureFSM::handleFrame(const HandKeypoints& kpRaw, double dtMs) {
     if (dtMs <= 0) dtMs = 1.0;
+
+    // 帧累计时间戳（双击判定用：两次捏合 tap 的间隔）
+    m_timeMs += static_cast<long>(dtMs);
 
     if (!m_cfgLoaded) {
         for (int i = 0; i < kHandKeypointCount; ++i) {
@@ -219,6 +252,9 @@ GestureEvent GestureFSM::handleFrame(const HandKeypoints& kpRaw, double dtMs) {
             lostEvent = GestureEvent::kDragEnd;
             std::printf("[FSM] 手丢失，拖拽强制结束\n");
         }
+        // 手丢失：重置双击/右键待定状态，避免恢复后误触发
+        m_lastClickTimeMs = -1;
+        m_rightClickPending = false;
         // 保持当前状态不变（IDLE 保持 IDLE，LOCKED 保持 LOCKED）
         return lostEvent;
     }
@@ -275,19 +311,44 @@ GestureEvent GestureFSM::handleFrame(const HandKeypoints& kpRaw, double dtMs) {
 
             // 拖拽判定：双指V手势（食指+中指伸直、无名指+小指弯曲）
             bool twoFinger = detectTwoFinger(kp);
+            // 三指判定（右键）：食指+中指+无名指伸直、小指弯曲
+            bool threeFinger = detectThreeFinger(kp);
 
-            // ---- 捏合单击（最高优先级，边沿触发防连发）----
+            // ---- 捏合 tap（最高优先级：单击/双击，边沿触发防连发）----
             if (pinched) {
                 if (!m_pinched) {
                     m_pinched = true;
                     m_holdMs = 0;  // 捏合中断开掌解锁计时
-                    event = GestureEvent::kClick;
-                    std::printf("[FSM] 单击（捏合 tap, 比例=%.2f）\n", pinchRatioNow);
+                    // 双击判定：距上次捏合 tap 间隔 < 阈值 → 双击；否则单击
+                    long nowMs = m_timeMs;
+                    long lastClick = m_lastClickTimeMs;
+                    if (lastClick >= 0 && (nowMs - lastClick) < m_cfg.doubleClickIntervalMs) {
+                        event = GestureEvent::kDoubleClick;
+                        m_lastClickTimeMs = -1;  // 双击消耗掉上次点击，避免三连触发
+                        std::printf("[FSM] 双击（两次捏合间隔 %ldms）\n", nowMs - lastClick);
+                    } else {
+                        event = GestureEvent::kClick;
+                        m_lastClickTimeMs = nowMs;
+                        std::printf("[FSM] 单击（捏合 tap, 比例=%.2f）\n", pinchRatioNow);
+                    }
                 }
                 // 捏合保持中：不发移动，避免误动
                 break;
             }
             m_pinched = false;  // 解除捏合，允许下次边沿触发
+
+            // ---- 三指右键（边沿触发防连发，与双指V/移动区分）----
+            if (threeFinger) {
+                if (!m_rightClickPending) {
+                    m_rightClickPending = true;
+                    m_holdMs = 0;  // 三指中断开掌解锁计时
+                    event = GestureEvent::kRightClick;
+                    std::printf("[FSM] 右键（三指）\n");
+                }
+                // 三指保持中：不发移动，避免误动
+                break;
+            }
+            m_rightClickPending = false;  // 解除三指，允许下次边沿触发
 
             // ---- 双指V拖拽：显式手势 ----
             if (twoFinger) {
@@ -309,7 +370,7 @@ GestureEvent GestureFSM::handleFrame(const HandKeypoints& kpRaw, double dtMs) {
                 break;
             }
 
-            // ---- 开掌解锁（非捏合、非双指V时才判定）----
+            // ---- 开掌解锁（非捏合、非三指、非双指V时才判定）----
             if (detectOpenPalm(kp)) {
                 m_holdMs += static_cast<int>(dtMs);
                 if (m_holdMs >= m_cfg.lockHoldMs && m_cooldownMs <= 0) {

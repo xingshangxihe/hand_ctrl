@@ -52,15 +52,17 @@ enum class CtrlState {
     kLocked = 1,   // 锁定运行：响应单指控制（定位/点击/拖拽）
 };
 
-// 手势事件枚举：状态机对外输出的识别结果（v2.5 捏合+双指V方案）
+// 手势事件枚举：状态机对外输出的识别结果（v2.6 捏合+双指V+三指方案）
 enum class GestureEvent {
-    kNone         = 0,   // 无动作
-    kOpenPalmHold = 1,   // 开掌长按：锁定/解锁开关（≥lock_hold_ms）
-    kPointerMove  = 2,   // 掌心定位移动（LOCKED 态非捏合/非双指V时每帧上报）
-    kClick        = 3,   // 拇指+食指捏合 tap：左键单击
-    kDragStart    = 4,   // 双指V手势出现：拖拽开始（左键按住）
-    kDragMove     = 5,   // 双指V保持中移动：拖拽移动（左键保持按下）
-    kDragEnd      = 6,   // 解除双指V：拖拽结束（释放左键）
+    kNone          = 0,   // 无动作
+    kOpenPalmHold  = 1,   // 开掌长按：锁定/解锁开关（≥lock_hold_ms）
+    kPointerMove   = 2,   // 掌心定位移动（LOCKED 态非捏合/非双指V/非三指时每帧上报）
+    kClick         = 3,   // 拇指+食指捏合 tap：左键单击
+    kDoubleClick   = 4,   // 两次捏合 tap 间隔 < 阈值：左键双击
+    kRightClick    = 5,   // 三指手势：左键→右键单击
+    kDragStart     = 6,   // 双指V手势出现：拖拽开始（左键按住）
+    kDragMove      = 7,   // 双指V保持中移动：拖拽移动（左键保持按下）
+    kDragEnd       = 8,   // 解除双指V：拖拽结束（释放左键）
 };
 
 // JSON 配置参数集合（运行时加载，所有阈值外置）
@@ -79,9 +81,11 @@ struct FsmConfig {
                                         // 视为该手指伸直。5 指全部伸直 = 开掌。
                                         // 拇指阈值自动放宽（×0.8），因其根紧邻手腕比值天然小
 
-    // 单击判定（捏合，v2.5.1）
-    float pinchRatio = 0.55f;           // 捏合比例阈值：拇指尖(4)到食指尖(8)距离 ÷ 中指根(9)到手腕(0)
-                                        // < 此值 = 捏合 → 单击。比例法对"手离摄像头远近"鲁棒
+    // 单击/双击判定（捏合，v2.6）
+    float pinchRatio = 0.7f;            // 捏合比例阈值：拇指尖(4)到食指尖(8)距离 ÷ 中指根(9)到手腕(0)
+                                        // < 此值 = 捏合 → 单击/双击。比例法对"手离摄像头远近"鲁棒
+    int   doubleClickIntervalMs = 500;  // 双击判定：两次捏合 tap 间隔 < 此值（毫秒）= 双击；
+                                        // ≥ 此值 = 普通单击
 
     // 拖拽判定（双指V，v2.5）
     int   dragFoldDistPx = 130;         // 双指V：无名指(16)/小指(20)到手腕距离 < 此值（弯曲）
@@ -145,9 +149,12 @@ private:
     CtrlState m_state = CtrlState::kIdle;   // 当前状态
     int       m_holdMs = 0;                 // 开掌（锁定手势）持续累计时长（毫秒）
     int       m_cooldownMs = 0;             // 状态切换防抖冷却计时器（毫秒）
+    long      m_timeMs = 0;                 // 帧累计时间戳（毫秒，双击判定用，随 dtMs 递增）
 
-    // 捏合/拖拽检测状态（v2.5 核心）
+    // 捏合/拖拽检测状态（v2.6 核心）
     bool  m_pinched = false;                // 捏合防连发：记录上一次是否捏合（边沿触发单击）
+    long  m_lastClickTimeMs = -1;           // 上次单击的时间戳（帧累计毫秒，双击判定用）
+    bool  m_rightClickPending = false;      // 三指右键防连发：边沿触发
     bool  m_dragging = false;               // 是否正在拖拽（双指V保持，左键按住中）
     float m_smoothPalmX = -1.f;             // 平滑后掌心（点9，中指根）X：移动/拖拽参考点
     float m_smoothPalmY = -1.f;             // 平滑后掌心 Y
@@ -168,6 +175,10 @@ private:
     // 双指V判定（拖拽手势）：食指(8)+中指(12)伸直（比值 > openPalmRatio），
     // 无名指(16)+小指(20)弯曲（到手腕距离 < dragFoldDistPx）
     bool detectTwoFinger(const HandKeypoints& kp);
+
+    // 三指判定（右键手势）：食指(8)+中指(12)+无名指(16)伸直（比值 > openPalmRatio），
+    // 小指(20)弯曲（到手腕距离 < dragFoldDistPx）。与双指V（2指）天然区分
+    bool detectThreeFinger(const HandKeypoints& kp);
 
     // 工具：计算两点欧式距离
     static float distance(float x1, float y1, float x2, float y2);

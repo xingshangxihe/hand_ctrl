@@ -35,6 +35,9 @@ public:
     // 鼠标左键单击
     void clickLeft();
 
+    // 鼠标左键双击（两次快速单击，间隔 50ms）
+    void doubleClick();
+
     // 鼠标左键拖拽（按下后移动，由调用方在合适时机调用 releaseLeft）
     void pressLeft();
     void releaseLeft();
