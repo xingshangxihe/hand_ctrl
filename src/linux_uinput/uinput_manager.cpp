@@ -25,6 +25,8 @@
 #include <cstdio>
 #include <cstring>
 #include <cerrno>
+#include <thread>
+#include <chrono>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
@@ -194,8 +196,13 @@ void UInputManager::moveMouse(int dx, int dy) {
 
 void UInputManager::clickLeft() {
     if (m_fdMouse < 0) return;
-    // 左键按下 + 释放 + 同步
+    // 左键单击：按下 → 同步 → 短暂保持 → 释放 → 同步
+    // 关键：按下和释放必须各带一次 SYN 分隔，且中间保持 ~20ms。
+    // 若按下/释放在同一 SYN 周期内发出，输入栈会认为"按住时间=0"，
+    // 点击事件被丢弃（表现为单击无效，但拖拽 pressLeft 单独发送有效）。
     emitEvent(m_fdMouse, EV_KEY, BTN_LEFT, 1);
+    emitSync(m_fdMouse);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));  // 保持 20ms，模拟真实点击
     emitEvent(m_fdMouse, EV_KEY, BTN_LEFT, 0);
     emitSync(m_fdMouse);
 }
