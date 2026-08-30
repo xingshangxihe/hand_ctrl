@@ -333,7 +333,6 @@ int main(int argc, char* argv[]) {
     // 拖拽期间隐藏画面窗口标志：拖拽时虚拟鼠标按住左键+移动，
     // 若指针落在画面窗口上会触发 GTK 窗口交互（拖动/点击），导致画面消失。
     // 方案：拖拽开始销毁窗口，结束立即重建，彻底避免冲突。
-    bool winHiddenForDrag = false;
     long long lastWatchdogUs = 0;  // 看门狗上次检查时间戳（独立计时，不依赖帧数）
     while (!g_shouldExit.load()) {
         // ---- 摄像头看门狗（放在循环最前，不依赖关键点队列！）----
@@ -369,9 +368,10 @@ int main(int argc, char* argv[]) {
 
         // ---- 画面显示：放在循环最前，不依赖关键点队列（摄像头断流时也持续刷新）----
         // 说明：imshow/waitKey 必须在主线程调用（GTK 限制）；时间驱动每 40ms 刷新。
-        // 拖拽期间窗口已被销毁（winHiddenForDrag=true），跳过整个显示块；
-        // 同时窗口关闭检测也被跳过，避免把"拖拽销毁"误判为"用户点×关闭"。
-        if (showGui && !winHiddenForDrag) {
+        // 注意：拖拽期间【不再销毁/重建窗口】——之前的 destroyWindow/namedWindow
+        // 在 GTK/VMware 下不稳定，会触发摄像头卡住（用户实测）。拖拽时窗口保持
+        // 显示，虚拟鼠标即使划过画面窗口也只是拖动窗口位置，不会导致画面丢失。
+        if (showGui) {
             auto nowD = std::chrono::steady_clock::now();
             double dispInterval = std::chrono::duration<double, std::milli>(nowD - lastDisplay).count();
             if (dispInterval >= 100.0) {  // 10fps，降低 VMware 渲染压力
@@ -594,24 +594,12 @@ int main(int argc, char* argv[]) {
 
             case GestureEvent::kDragStart:
                 uinput.pressLeft();  // 拖拽开始：按住左键
-                // 拖拽期间隐藏画面窗口：拖拽时虚拟鼠标按住左键+移动，
-                // 若指针落在画面窗口上会触发 GTK 窗口交互（拖动/点击），
-                // 导致画面消失/卡顿。销毁窗口彻底避免冲突，结束拖拽立即恢复。
-                if (showGui && !winHiddenForDrag) {
-                    cv::destroyWindow("hand-ctrl");
-                    winHiddenForDrag = true;
-                    std::printf("[main] 拖拽中，画面窗口已隐藏\n");
-                }
+                // 注意：不再销毁画面窗口。之前 destroyWindow 在 GTK/VMware 下
+                // 不稳定，会引发摄像头卡住（实测）。拖拽时窗口保持显示即可。
                 break;
 
             case GestureEvent::kDragEnd:
                 uinput.releaseLeft();  // 拖拽结束：释放左键
-                // 拖拽结束立即恢复画面窗口
-                if (showGui && winHiddenForDrag) {
-                    cv::namedWindow("hand-ctrl", cv::WINDOW_NORMAL);
-                    winHiddenForDrag = false;
-                    std::printf("[main] 拖拽结束，画面窗口已恢复\n");
-                }
                 break;
 
             case GestureEvent::kNone:
