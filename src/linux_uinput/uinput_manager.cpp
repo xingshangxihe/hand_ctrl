@@ -238,8 +238,12 @@ void UInputManager::releaseLeft() {
 
 void UInputManager::clickRight() {
     if (m_fdMouse < 0) return;
-    // 右键按下 + 释放 + 同步
+    // 右键单击：按下 → 同步 → 短暂保持 → 释放 → 同步
+    // 与 clickLeft 同理：按下/释放必须各带 SYN 分隔，否则输入栈认为
+    // "按住时间=0"，点击事件被丢弃（表现为右键无效）。
     emitEvent(m_fdMouse, EV_KEY, BTN_RIGHT, 1);
+    emitSync(m_fdMouse);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));  // 保持 20ms，模拟真实点击
     emitEvent(m_fdMouse, EV_KEY, BTN_RIGHT, 0);
     emitSync(m_fdMouse);
 }
