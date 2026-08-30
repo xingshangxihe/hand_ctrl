@@ -58,6 +58,13 @@ static std::atomic<bool> g_shouldExit{false};
 // 说明：正式使用（上架演示）时画面更干净，调试时仍可看到完整流程
 static std::atomic<bool> g_quiet{false};
 
+// 摄像头看门狗：采集线程每次成功读帧后更新此时间戳（毫秒，steady_clock），
+// 主线程周期性检查——若长时间无新帧（采集线程卡死/摄像头断流），强制重开摄像头。
+// 背景：VMware 虚拟 USB 摄像头长时间运行后 V4L2 poll 可能永久不返回（卡死），
+//       此时采集线程的 failCnt 不再增长，"连续失败 50 次自动重开"永远不触发，
+//       画面冻结。看门狗由主线程驱动，从外部强制恢复。
+static std::atomic<long long> g_lastFrameUs{0};
+
 static void onSignal(int) {
     g_shouldExit.store(true);
     std::printf("\n[main] 收到退出信号，正在停止线程...\n");
@@ -198,6 +205,9 @@ int main(int argc, char* argv[]) {
                 }
                 ++capCnt;
                 failCnt = 0;
+                // 更新看门狗时间戳（主线程据此检测采集卡死）
+                g_lastFrameUs.store(std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count());
                 // 心跳：每 60 帧打印一次采集状态（-q 静默模式下不打印）
                 if (capCnt % 60 == 0 && !g_quiet.load()) {
                     std::printf("[capture] 已采集 %d 帧\n", capCnt);
@@ -414,11 +424,37 @@ int main(int argc, char* argv[]) {
         // FSM 推进
         GestureEvent e = fsm.handleFrame(kp, dtMs);
         ++fsmCnt;
-        // 配置热加载：每 60 帧（约 1 秒）检测配置文件变更，实时生效阈值
+        // 配置热加载 + 摄像头看门狗：每 60 帧（约 1 秒）检测一次
         if (fsmCnt % 60 == 0) {
             if (fsm.reloadIfChanged()) {
                 std::printf("[main] 配置已热加载，屏幕=%dx%d\n",
                             fsm.screenWidth(), fsm.screenHeight());
+            }
+            // 摄像头看门狗：若超过 3 秒无新帧（采集线程卡死在 V4L2 poll /
+            // 摄像头断流），强制重开摄像头恢复。close(fd) 会中断采集线程的 poll。
+            {
+                long long nowUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+                long long lastUs = g_lastFrameUs.load();
+                if (lastUs > 0 && (nowUs - lastUs) > 3'000'000LL) {
+                    // 冷却：上次重开在 10 秒内不再尝试（避免摄像头彻底损坏时无限刷屏）
+                    static long long lastRestartUs = 0;
+                    if (lastRestartUs > 0 && (nowUs - lastRestartUs) < 10'000'000LL) {
+                        // 静默等待，不做动作
+                    } else {
+                        lastRestartUs = nowUs;
+                        std::printf("[main] 看门狗：摄像头 %lld 秒无新帧，强制重开...\n",
+                                    (nowUs - lastUs) / 1000000);
+                        camera.release();  // close(fd) → 采集线程 poll 中断返回
+                        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+                        if (camera.open(deviceIndex)) {
+                            g_lastFrameUs.store(0);  // 等待采集线程恢复后更新
+                            std::printf("[main] 看门狗：摄像头已重开\n");
+                        } else {
+                            std::fprintf(stderr, "[main] 看门狗：摄像头重开失败，请检查设备连接\n");
+                        }
+                    }
+                }
             }
             if (!g_quiet.load()) {
                 const auto& w = kp.points.empty() ? HandPoint{} : kp.points[0];
