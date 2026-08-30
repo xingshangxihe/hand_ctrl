@@ -594,7 +594,7 @@ static const char* eventToString(GestureEvent e) {
         case GestureEvent::kPointerMove: return "食指定位移动";
         case GestureEvent::kClick:       return "捏合点击(左键)";
         case GestureEvent::kDoubleClick: return "捏合双击(左键)";
-        case GestureEvent::kRightClick:  return "三指(右键)";
+        case GestureEvent::kRightClick:  return "拇指小指捏合(右键)";
         case GestureEvent::kDragStart:   return "拖拽开始";
         case GestureEvent::kDragMove:    return "拖拽移动";
         case GestureEvent::kDragEnd:     return "拖拽结束";

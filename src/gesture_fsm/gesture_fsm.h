@@ -52,14 +52,14 @@ enum class CtrlState {
     kLocked = 1,   // 锁定运行：响应单指控制（定位/点击/拖拽）
 };
 
-// 手势事件枚举：状态机对外输出的识别结果（v2.6 捏合+双指V+三指方案）
+// 手势事件枚举：状态机对外输出的识别结果（v2.6.1 捏合+拇指小指+双指V方案）
 enum class GestureEvent {
     kNone          = 0,   // 无动作
     kOpenPalmHold  = 1,   // 开掌长按：锁定/解锁开关（≥lock_hold_ms）
-    kPointerMove   = 2,   // 掌心定位移动（LOCKED 态非捏合/非双指V/非三指时每帧上报）
+    kPointerMove   = 2,   // 掌心定位移动（LOCKED 态非捏合/非拇指小指/非双指V时每帧上报）
     kClick         = 3,   // 拇指+食指捏合 tap：左键单击
     kDoubleClick   = 4,   // 两次捏合 tap 间隔 < 阈值：左键双击
-    kRightClick    = 5,   // 三指手势：左键→右键单击
+    kRightClick    = 5,   // 拇指+小指捏合：右键单击
     kDragStart     = 6,   // 双指V手势出现：拖拽开始（左键按住）
     kDragMove      = 7,   // 双指V保持中移动：拖拽移动（左键保持按下）
     kDragEnd       = 8,   // 解除双指V：拖拽结束（释放左键）
@@ -90,6 +90,10 @@ struct FsmConfig {
     // 拖拽判定（双指V，v2.5）
     int   dragFoldDistPx = 130;         // 双指V：无名指(16)/小指(20)到手腕距离 < 此值（弯曲）
                                         // 食指(8)/中指(12)伸直用 openPalmRatio 比值判定
+
+    // 右键判定（拇指+小指捏合，v2.6.1）
+    float rightClickThumbPinkyRatio = 0.6f;  // 拇指尖(4)到小指尖(20)距离 ÷ 中指根(9)到手腕(0)
+                                        // < 此值 = 拇指小指捏合 → 右键。与双指V特征完全不同
 
     // 鼠标相对位移增益（触控板式，各方向独立）
     float mouseGainX = 2.0f;            // 水平增益：鼠标位移 = 指尖画面位移×(屏幕宽/画面宽)×gain
@@ -154,7 +158,7 @@ private:
     // 捏合/拖拽检测状态（v2.6 核心）
     bool  m_pinched = false;                // 捏合防连发：记录上一次是否捏合（边沿触发单击）
     long  m_lastClickTimeMs = -1;           // 上次单击的时间戳（帧累计毫秒，双击判定用）
-    bool  m_rightClickPending = false;      // 三指右键防连发：边沿触发
+    bool  m_rightClickPending = false;      // 拇指小指捏合右键防连发：边沿触发
     bool  m_dragging = false;               // 是否正在拖拽（双指V保持，左键按住中）
     float m_smoothPalmX = -1.f;             // 平滑后掌心（点9，中指根）X：移动/拖拽参考点
     float m_smoothPalmY = -1.f;             // 平滑后掌心 Y
@@ -176,9 +180,10 @@ private:
     // 无名指(16)+小指(20)弯曲（到手腕距离 < dragFoldDistPx）
     bool detectTwoFinger(const HandKeypoints& kp);
 
-    // 三指判定（右键手势）：食指(8)+中指(12)+无名指(16)伸直（比值 > openPalmRatio），
-    // 小指(20)弯曲（到手腕距离 < dragFoldDistPx）。与双指V（2指）天然区分
-    bool detectThreeFinger(const HandKeypoints& kp);
+    // 拇指+小指捏合判定（右键手势）：拇指尖(4)到小指尖(20)距离 ÷ 中指根(9)到手腕(0)
+    // < rightClickThumbPinkyRatio。拇指小指在手掌相对两侧，捏合时距离骤减；
+    // 与双指V拖拽（食+中指伸直）的检测特征完全不同，绝不误判
+    bool detectThumbPinky(const HandKeypoints& kp);
 
     // 工具：计算两点欧式距离
     static float distance(float x1, float y1, float x2, float y2);
