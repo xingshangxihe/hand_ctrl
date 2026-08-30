@@ -248,30 +248,15 @@ GestureEvent GestureFSM::handleFrame(const HandKeypoints& kpRaw, double dtMs) {
             break;
 
         case CtrlState::kLocked:
-            // LOCKED 态：开掌解锁 / 捏合单击 + 双指V拖拽 + 食指伸出（移动）
-            if (detectOpenPalm(kp)) {
-                // ---- 开掌：累计长按解锁 ----
-                m_holdMs += static_cast<int>(dtMs);
-                if (m_holdMs >= m_cfg.lockHoldMs && m_cooldownMs <= 0) {
-                    m_state = CtrlState::kIdle;
-                    m_holdMs = 0;
-                    m_cooldownMs = m_cfg.stateCooldownMs;
-                    m_pinched = false;
-                    m_dragging = false;
-                    event = GestureEvent::kOpenPalmHold;
-                    std::printf("[FSM] 状态迁移：LOCKED → IDLE（已解锁）\n");
-                }
-                break;  // 开掌期间不响应定位/点击
-            }
-
-            // ---- 非开掌：捏合单击 / 双指V拖拽 / 食指伸出移动 ----
+            // LOCKED 态：捏合单击 + 双指V拖拽 + 开掌解锁 + 食指伸出移动
             // 记录平滑后掌心（点9，中指根）坐标供上层做相对位移
-            // （掌心在手部中央，双指V拖拽时也可用）
             m_smoothPalmX = kp.points[9].x;
             m_smoothPalmY = kp.points[9].y;
 
-            // 单击判定：捏合 = 拇指尖(4)到食指尖(8)距离 / 中指根(9)到手腕(0)距离 < 阈值
-            // 用比例而非绝对像素：手离摄像头远近不影响判定（远处手小、距离等比缩小）
+            // 捏合判定：拇指尖(4)到食指尖(8)距离 / 中指根(9)到手腕(0)距离 < 阈值
+            // 比例法对"手离摄像头远近"鲁棒。注意：必须放在开掌判定之前！
+            //   原因：捏合时其余手指可能仍伸直（OK 手势），会被 detectOpenPalm
+            //   误判为开掌 → 走解锁分支 → 捏合永不触发（用户反馈"完全没反应"）。
             float pinchDist = distance(kp.points[4].x, kp.points[4].y,
                                        kp.points[8].x, kp.points[8].y);
             float handSize = distance(kp.points[9].x, kp.points[9].y,
@@ -279,27 +264,32 @@ GestureEvent GestureFSM::handleFrame(const HandKeypoints& kpRaw, double dtMs) {
             float pinchRatioNow = (handSize > 1e-6f) ? (pinchDist / handSize) : 1.f;
             bool pinched = (pinchRatioNow < m_cfg.pinchRatio);
 
-            // 诊断日志：每 60 帧打印捏合比例（帮助调阈值）
-            static int pinchDiagCnt = 0;
-            if (++pinchDiagCnt % 60 == 1) {
-                std::printf("[FSM] 捏合诊断 比例=%.2f (阈值 %.2f) dist=%.0fpx handSize=%.0fpx\n",
-                            pinchRatioNow, m_cfg.pinchRatio, pinchDist, handSize);
-            }
-
             // 拖拽判定：双指V手势（食指+中指伸直、无名指+小指弯曲）
             bool twoFinger = detectTwoFinger(kp);
 
-            // ---- 双指V拖拽：优先级最高（显式手势，与移动/捏合完全不同）----
+            // ---- 捏合单击（最高优先级，边沿触发防连发）----
+            if (pinched) {
+                if (!m_pinched) {
+                    m_pinched = true;
+                    m_holdMs = 0;  // 捏合中断开掌解锁计时
+                    event = GestureEvent::kClick;
+                    std::printf("[FSM] 单击（捏合 tap, 比例=%.2f）\n", pinchRatioNow);
+                }
+                // 捏合保持中：不发移动，避免误动
+                break;
+            }
+            m_pinched = false;  // 解除捏合，允许下次边沿触发
+
+            // ---- 双指V拖拽：显式手势 ----
             if (twoFinger) {
                 if (!m_dragging) {
                     m_dragging = true;
-                    m_pinched = false;  // 拖拽期间不响应捏合
                     event = GestureEvent::kDragStart;
                     std::printf("[FSM] 拖拽开始（双指V）\n");
                 } else {
                     event = GestureEvent::kDragMove;  // 双指V保持：拖拽移动
                 }
-                break;  // 双指V期间不处理移动/单击
+                break;  // 双指V期间不处理移动/开掌解锁
             }
 
             // ---- 拖拽结束：双指V解除 ----
@@ -310,19 +300,23 @@ GestureEvent GestureFSM::handleFrame(const HandKeypoints& kpRaw, double dtMs) {
                 break;
             }
 
-            // ---- 捏合单击（边沿触发防连发）----
-            if (pinched) {
-                if (!m_pinched) {
-                    m_pinched = true;
-                    event = GestureEvent::kClick;
-                    std::printf("[FSM] 单击（捏合 tap）\n");
+            // ---- 开掌解锁（非捏合、非双指V时才判定）----
+            if (detectOpenPalm(kp)) {
+                m_holdMs += static_cast<int>(dtMs);
+                if (m_holdMs >= m_cfg.lockHoldMs && m_cooldownMs <= 0) {
+                    m_state = CtrlState::kIdle;
+                    m_holdMs = 0;
+                    m_cooldownMs = m_cfg.stateCooldownMs;
+                    m_dragging = false;
+                    event = GestureEvent::kOpenPalmHold;
+                    std::printf("[FSM] 状态迁移：LOCKED → IDLE（已解锁）\n");
                 }
-                // 捏合保持中：不发移动，避免误动
-            } else {
-                m_pinched = false;  // 解除捏合，允许下次边沿触发
-                // ---- 食指伸出：相对位移移动 ----
-                event = GestureEvent::kPointerMove;
+                break;  // 开掌期间不响应移动
             }
+            m_holdMs = (m_holdMs > 30) ? (m_holdMs - 30) : 0;
+
+            // ---- 食指伸出：相对位移移动 ----
+            event = GestureEvent::kPointerMove;
             break;
     }
 
