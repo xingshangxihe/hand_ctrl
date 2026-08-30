@@ -218,8 +218,9 @@ int main(int argc, char* argv[]) {
                 if (failCnt % 10 == 1) {
                     std::printf("[capture] 读帧失败累计=%d\n", failCnt);
                 }
-                // 连续失败过多（约 5 秒无帧）：自动重开摄像头恢复
-                if (failCnt == 50) {
+                // 连续失败过多（约 15 秒）：自动重开摄像头恢复
+                // （花屏持续失败时 g_lastFrameUs 不更新，主线程看门狗也会兜底）
+                if (failCnt == 15) {
                     std::printf("[capture] 连续失败过多，自动重开摄像头...\n");
                     camera.release();
                     std::this_thread::sleep_for(std::chrono::milliseconds(500));
@@ -317,7 +318,44 @@ int main(int argc, char* argv[]) {
     // 若指针落在画面窗口上会触发 GTK 窗口交互（拖动/点击），导致画面消失。
     // 方案：拖拽开始销毁窗口，结束立即重建，彻底避免冲突。
     bool winHiddenForDrag = false;
+    long long lastWatchdogUs = 0;  // 看门狗上次检查时间戳（独立计时，不依赖帧数）
     while (!g_shouldExit.load()) {
+        // ---- 摄像头看门狗（放在循环最前，不依赖关键点队列！）----
+        // 背景：摄像头花屏/MJPG 解码持续失败时，g_lastFrameUs 不更新（无新帧），
+        //       必须强制重开摄像头恢复。若放在 FSM 推进后，帧队列空时主循环
+        //       会 continue 跳过它 → 看门狗永不执行。故独立放置于此。
+        {
+            long long nowUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            if (lastWatchdogUs == 0) {
+                lastWatchdogUs = nowUs;  // 首帧初始化
+            }
+            // 每 1 秒检查一次（不依赖 fsmCnt）
+            if (nowUs - lastWatchdogUs >= 1'000'000LL) {
+                lastWatchdogUs = nowUs;
+                long long lastUs = g_lastFrameUs.load();
+                if (lastUs > 0 && (nowUs - lastUs) > 3'000'000LL) {
+                    // 冷却：上次重开在 10 秒内不再尝试（避免摄像头彻底损坏时无限刷屏）
+                    static long long lastRestartUs = 0;
+                    if (lastRestartUs > 0 && (nowUs - lastRestartUs) < 10'000'000LL) {
+                        // 静默等待，不做动作
+                    } else {
+                        lastRestartUs = nowUs;
+                        std::printf("[main] 看门狗：摄像头 %lld 秒无新帧，强制重开...\n",
+                                    (nowUs - lastUs) / 1000000);
+                        camera.release();  // close(fd) → 采集线程 poll 中断返回
+                        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+                        if (camera.open(deviceIndex)) {
+                            g_lastFrameUs.store(0);  // 等待采集线程恢复后更新
+                            std::printf("[main] 看门狗：摄像头已重开\n");
+                        } else {
+                            std::fprintf(stderr, "[main] 看门狗：摄像头重开失败，请检查设备连接\n");
+                        }
+                    }
+                }
+            }
+        }
+
         // ---- 画面显示：放在循环最前，不依赖关键点队列（摄像头断流时也持续刷新）----
         // 说明：imshow/waitKey 必须在主线程调用（GTK 限制）；时间驱动每 40ms 刷新。
         // 拖拽期间窗口已被销毁（winHiddenForDrag=true），跳过整个显示块；
@@ -424,37 +462,11 @@ int main(int argc, char* argv[]) {
         // FSM 推进
         GestureEvent e = fsm.handleFrame(kp, dtMs);
         ++fsmCnt;
-        // 配置热加载 + 摄像头看门狗：每 60 帧（约 1 秒）检测一次
+        // 配置热加载：每 60 帧（约 1 秒）检测配置文件变更，实时生效阈值
         if (fsmCnt % 60 == 0) {
             if (fsm.reloadIfChanged()) {
                 std::printf("[main] 配置已热加载，屏幕=%dx%d\n",
                             fsm.screenWidth(), fsm.screenHeight());
-            }
-            // 摄像头看门狗：若超过 3 秒无新帧（采集线程卡死在 V4L2 poll /
-            // 摄像头断流），强制重开摄像头恢复。close(fd) 会中断采集线程的 poll。
-            {
-                long long nowUs = std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::steady_clock::now().time_since_epoch()).count();
-                long long lastUs = g_lastFrameUs.load();
-                if (lastUs > 0 && (nowUs - lastUs) > 3'000'000LL) {
-                    // 冷却：上次重开在 10 秒内不再尝试（避免摄像头彻底损坏时无限刷屏）
-                    static long long lastRestartUs = 0;
-                    if (lastRestartUs > 0 && (nowUs - lastRestartUs) < 10'000'000LL) {
-                        // 静默等待，不做动作
-                    } else {
-                        lastRestartUs = nowUs;
-                        std::printf("[main] 看门狗：摄像头 %lld 秒无新帧，强制重开...\n",
-                                    (nowUs - lastUs) / 1000000);
-                        camera.release();  // close(fd) → 采集线程 poll 中断返回
-                        std::this_thread::sleep_for(std::chrono::milliseconds(300));
-                        if (camera.open(deviceIndex)) {
-                            g_lastFrameUs.store(0);  // 等待采集线程恢复后更新
-                            std::printf("[main] 看门狗：摄像头已重开\n");
-                        } else {
-                            std::fprintf(stderr, "[main] 看门狗：摄像头重开失败，请检查设备连接\n");
-                        }
-                    }
-                }
             }
             if (!g_quiet.load()) {
                 const auto& w = kp.points.empty() ? HandPoint{} : kp.points[0];
