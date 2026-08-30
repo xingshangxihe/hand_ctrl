@@ -167,10 +167,13 @@ bool GestureFSM::detectOpenPalm(const HandKeypoints& kp) {
 }
 
 // --------------------------- 双指V判定（拖拽手势） ---------------------------
-// 判定：食指(8)+中指(12)伸直（指尖到手腕/指根到手腕比值 > openPalmRatio），
-//       无名指(16)+小指(20)弯曲（到手腕距离 < dragFoldDistPx）。
-// 显式手型：与移动（单指/张手）、单击（捏合）完全不同，绝无冲突。
-// 说明：摆出"V"字手势（两根手指比胜利）即进入拖拽，收手即释放。
+// 判定（v2.6.3 加强版，解决"移动时食指伸出被误判为双指V"）：
+//   1. 食指(8)/中指(12)必须伸直：指尖/指根 比值 > openPalmRatio
+//   2. 【新增】食指尖(8)与中指尖(12)必须明显分开：两指尖距离 / 手尺寸 > 阈值
+//      —— V字手势两指张开（距离大），单指移动时食指与中指并拢（距离小）。
+//        这是区分"移动（单指）"与"拖拽（双指V）"的关键判据！
+//   3. 无名指(16)/小指(20)必须弯曲：到手腕距离 < dragFoldDistPx
+// 说明：摆出"V"字手势（两根手指明显分开比胜利）即进入拖拽，收手即释放。
 bool GestureFSM::detectTwoFinger(const HandKeypoints& kp) {
     if (kp.points.size() < 21) return false;
     const auto& w = kp.points[0];  // 手腕
@@ -186,6 +189,16 @@ bool GestureFSM::detectTwoFinger(const HandKeypoints& kp) {
         float root = distance(kp.points[9].x, kp.points[9].y, w.x, w.y);
         if (root < 1e-6f || tip / root < m_cfg.openPalmRatio) return false;
     }
+    // 关键判据：食指尖(8)与中指尖(12)明显分开（V字特征）。
+    //   比值 = 两指尖距离 / 中指根(9)到手腕(0)（手尺寸基准）
+    //   双指V：两指张开，比值大（>1.0）；单指移动：两指并拢，比值小（<0.5）
+    float twoTipDist = distance(kp.points[8].x, kp.points[8].y,
+                                kp.points[12].x, kp.points[12].y);
+    float handSize = distance(kp.points[9].x, kp.points[9].y,
+                              kp.points[0].x, kp.points[0].y);
+    if (handSize < 1e-6f) return false;
+    if (twoTipDist / handSize < 0.6f) return false;  // 两指未分开 → 非V字
+
     // 无名指(16)/小指(20)必须弯曲：到手腕距离 < 阈值
     if (distance(kp.points[16].x, kp.points[16].y, w.x, w.y) >= m_cfg.dragFoldDistPx) return false;
     if (distance(kp.points[20].x, kp.points[20].y, w.x, w.y) >= m_cfg.dragFoldDistPx) return false;
