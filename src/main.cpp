@@ -59,11 +59,17 @@ static std::atomic<bool> g_shouldExit{false};
 static std::atomic<bool> g_quiet{false};
 
 // 摄像头看门狗：采集线程每次成功读帧后更新此时间戳（毫秒，steady_clock），
-// 主线程周期性检查——若长时间无新帧（采集线程卡死/摄像头断流），强制重开摄像头。
+// 主线程周期性检查——若长时间无新帧（采集线程卡死/摄像头断流），请求重开摄像头。
 // 背景：VMware 虚拟 USB 摄像头长时间运行后 V4L2 poll 可能永久不返回（卡死），
-//       此时采集线程的 failCnt 不再增长，"连续失败 50 次自动重开"永远不触发，
-//       画面冻结。看门狗由主线程驱动，从外部强制恢复。
+//       此时采集线程的 failCnt 不再增长，画面冻结。看门狗由主线程驱动。
+//
+// 关键设计（避免并发重开 EBUSY）：
+//   摄像头设备只能由一个线程执行 release/open。因此主线程看门狗【不直接操作
+//   摄像头】，而是设置 g_cameraRestartRequested 标志，由采集线程响应标志执行重开。
+//   若主线程直接 camera.open()，会与采集线程的自动重开并发 → EBUSY 死循环
+//   （实测：看门狗 open 成功瞬间采集线程也在 open，设备忙，无法恢复）。
 static std::atomic<long long> g_lastFrameUs{0};
+static std::atomic<bool> g_cameraRestartRequested{false};
 
 static void onSignal(int) {
     g_shouldExit.store(true);
@@ -187,12 +193,26 @@ int main(int argc, char* argv[]) {
     std::mutex kpMutex;
     HandKeypoints latestKp;
 
-    // 7. 采集线程：持续读帧（失败连续超过阈值自动重开摄像头）
+    // 7. 采集线程：持续读帧（摄像头重开统一由本线程执行，避免与主线程并发操作设备）
     std::thread captureThread([&]() {
         cv::Mat frame;
         int capCnt = 0;
         int failCnt = 0;
         while (!g_shouldExit.load()) {
+            // 响应看门狗/自身重开请求：摄像头设备必须由本线程独占重开
+            // （主线程看门狗只设置标志，不直接 open，避免并发 EBUSY）
+            if (g_cameraRestartRequested.load()) {
+                g_cameraRestartRequested.store(false);
+                std::printf("[capture] 收到重启请求，重开摄像头...\n");
+                camera.release();
+                std::this_thread::sleep_for(std::chrono::milliseconds(300));
+                if (camera.open(deviceIndex)) {
+                    std::printf("[capture] 摄像头重开成功\n");
+                } else {
+                    std::fprintf(stderr, "[capture] 摄像头重开失败\n");
+                }
+                failCnt = 0;
+            }
             if (camera.readFrame(frame)) {
                 // 水平翻转（镜像）：摄像头是"被看视角"，不翻转时手往左走画面里手往右，
                 // 鼠标方向与直觉相反。翻转后画面如照镜子，手往左画面往左 → 鼠标往左。
@@ -218,14 +238,10 @@ int main(int argc, char* argv[]) {
                 if (failCnt % 10 == 1) {
                     std::printf("[capture] 读帧失败累计=%d\n", failCnt);
                 }
-                // 连续失败过多（约 15 秒）：自动重开摄像头恢复
-                // （花屏持续失败时 g_lastFrameUs 不更新，主线程看门狗也会兜底）
+                // 连续失败过多（约 1.5 秒×15=22 秒）：请求重开摄像头
+                // （统一走 g_cameraRestartRequested 标志，由本线程下一轮执行重开）
                 if (failCnt == 15) {
-                    std::printf("[capture] 连续失败过多，自动重开摄像头...\n");
-                    camera.release();
-                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
-                    camera.open(deviceIndex);
-                    failCnt = 0;
+                    g_cameraRestartRequested.store(true);
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
             }
@@ -335,22 +351,17 @@ int main(int argc, char* argv[]) {
                 lastWatchdogUs = nowUs;
                 long long lastUs = g_lastFrameUs.load();
                 if (lastUs > 0 && (nowUs - lastUs) > 3'000'000LL) {
-                    // 冷却：上次重开在 10 秒内不再尝试（避免摄像头彻底损坏时无限刷屏）
-                    static long long lastRestartUs = 0;
-                    if (lastRestartUs > 0 && (nowUs - lastRestartUs) < 10'000'000LL) {
+                    // 冷却：上次请求在 10 秒内不再重复发（避免摄像头彻底损坏时无限刷屏）
+                    static long long lastRequestUs = 0;
+                    if (lastRequestUs > 0 && (nowUs - lastRequestUs) < 10'000'000LL) {
                         // 静默等待，不做动作
                     } else {
-                        lastRestartUs = nowUs;
-                        std::printf("[main] 看门狗：摄像头 %lld 秒无新帧，强制重开...\n",
+                        lastRequestUs = nowUs;
+                        std::printf("[main] 看门狗：摄像头 %lld 秒无新帧，请求重开...\n",
                                     (nowUs - lastUs) / 1000000);
-                        camera.release();  // close(fd) → 采集线程 poll 中断返回
-                        std::this_thread::sleep_for(std::chrono::milliseconds(300));
-                        if (camera.open(deviceIndex)) {
-                            g_lastFrameUs.store(0);  // 等待采集线程恢复后更新
-                            std::printf("[main] 看门狗：摄像头已重开\n");
-                        } else {
-                            std::fprintf(stderr, "[main] 看门狗：摄像头重开失败，请检查设备连接\n");
-                        }
+                        // 关键：只设置标志，由采集线程独占执行 release/open，
+                        // 避免两个线程并发操作摄像头设备导致 EBUSY 无法恢复。
+                        g_cameraRestartRequested.store(true);
                     }
                 }
             }
