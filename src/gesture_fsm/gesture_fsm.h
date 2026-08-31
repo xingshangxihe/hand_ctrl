@@ -101,6 +101,8 @@ struct FsmConfig {
     // 图像尺寸（用于坐标映射比例计算）
     int   imageWidth  = 640;
     int   imageHeight = 480;
+    // 摄像头采集帧率（降低可减少 VMware 虚拟 USB 带宽压力，降低 MJPG 损坏概率）
+    int   cameraFps   = 30;
 
     // 目标屏幕分辨率（绝对定位映射目标）
     int   screenWidth  = 1920;
@@ -142,6 +144,9 @@ public:
     // 获取图像尺寸（供上层做坐标映射）
     int imageWidth() const  { return m_cfg.imageWidth; }
     int imageHeight() const { return m_cfg.imageHeight; }
+
+    // 获取摄像头采集帧率（供上层 open 摄像头使用）
+    int cameraFps() const { return m_cfg.cameraFps; }
 
     // 获取鼠标相对位移增益系数（各方向独立）
     float mouseGainX() const { return m_cfg.mouseGainX; }

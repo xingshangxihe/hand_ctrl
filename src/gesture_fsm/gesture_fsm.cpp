@@ -80,6 +80,7 @@ bool GestureFSM::loadConfig(const std::string& configPath) {
     jsonGetFloat(json, "gain_y",                       m_cfg.mouseGainY);
     jsonGetInt  (json, "width",                       m_cfg.imageWidth);
     jsonGetInt  (json, "height",                      m_cfg.imageHeight);
+    jsonGetInt  (json, "fps",                         m_cfg.cameraFps);
     jsonGetInt  (json, "screen_width",                m_cfg.screenWidth);
     jsonGetInt  (json, "screen_height",               m_cfg.screenHeight);
 
@@ -257,11 +258,18 @@ GestureEvent GestureFSM::handleFrame(const HandKeypoints& kpRaw, double dtMs) {
     if (!kp.valid || kp.points.size() < kHandKeypointCount || lowConfidence) {
         m_holdMs = 0;
         GestureEvent lostEvent = GestureEvent::kNone;
-        if (m_dragging || m_pinched) {
+        if (m_dragging) {
+            // 真拖拽（双指V保持中）手丢失：必须释放左键
             m_dragging = false;
             m_pinched = false;
             lostEvent = GestureEvent::kDragEnd;
             std::printf("[FSM] 手丢失，拖拽强制结束\n");
+        } else if (m_pinched) {
+            // 仅捏合状态（单击/双击边沿已触发）手丢失：不产生拖拽事件。
+            // 修复：用户捏合单击后手自然收回，palm 可能短暂丢失，此场景
+            // 误发 kDragEnd（被日志误报"拖拽强制结束"）纯属状态混乱。
+            m_pinched = false;
+            std::printf("[FSM] 手丢失，捏合状态复位（非拖拽）\n");
         }
         // 手丢失：重置双击/右键待定状态，避免恢复后误触发
         m_lastClickTimeMs = -1;

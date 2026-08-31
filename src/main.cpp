@@ -165,9 +165,9 @@ int main(int argc, char* argv[]) {
         return static_cast<int>(ErrorCode::kModelLoadFailed);
     }
 
-    // 4. 打开摄像头
+    // 4. 打开摄像头（分辨率/帧率取自配置：降低可减少 VMware 虚拟 USB 带宽压力）
     Camera camera;
-    if (!camera.open(deviceIndex)) {
+    if (!camera.open(deviceIndex, fsm.imageWidth(), fsm.imageHeight(), fsm.cameraFps())) {
         std::fprintf(stderr, "[main] 摄像头打开失败，程序退出\n");
         return static_cast<int>(ErrorCode::kCameraOpenFailed);
     }
@@ -206,7 +206,7 @@ int main(int argc, char* argv[]) {
                 std::printf("[capture] 收到重启请求，重开摄像头...\n");
                 camera.release();
                 std::this_thread::sleep_for(std::chrono::milliseconds(300));
-                if (camera.open(deviceIndex)) {
+                if (camera.open(deviceIndex, fsm.imageWidth(), fsm.imageHeight(), fsm.cameraFps())) {
                     std::printf("[capture] 摄像头重开成功\n");
                     // 丢弃启动期坏帧：VMware 虚拟摄像头重开后流刚建立，
                     // 前几帧可能是花屏/损坏帧（imdecode 能解出但内容错乱），
