@@ -6,10 +6,11 @@
 //       - readFrame() 读取单帧图像（cv::Mat）
 //       - release()   释放摄像头资源
 // 设计要点：
-//   - 内部采用 pimpl 模式，封装 Linux V4L2 直接抓 MJPG 字节 + OpenCV imdecode 解码
-//   - 选用此方案的原因：本项目在 VMware 直通 UVC 摄像头场景下，MJPG 流存在
-//     EOI 缺失等不标准情况；OpenCV 自带的 V4L2 MJPG 解码器处理失败产生花屏，
-//     而 cv::imdecode（基于 libjpeg）宽容性更高、且能稳定解码。
+//   - 内部采用 pimpl 模式，封装 Linux V4L2 直读。
+//   - 采集格式：优先 YUYV（未压缩，无 MJPG 损坏问题），失败自动回退 MJPG。
+//     VMware 直通 UVC 摄像头下 MJPG 流本身频繁损坏（libjpeg 报 Corrupt JPEG），
+//     应用层无法修复；YUYV 是未压缩像素流，从源头消除"解码出半张坏图"故障。
+//   - MJPG 回退路径：V4L2 抓原始字节 + OpenCV imdecode 宽容解码（容错 EOI 缺失）。
 //   - 对外接口保持极简（open / readFrame / release / isOpened），
 //     业务代码无需关心底层是 V4L2 还是 VideoCapture。
 // ============================================================================

@@ -39,6 +39,11 @@ struct Camera::Impl {
     int                       m_deviceIndex = 0;// 当前打开的设备索引（仅日志使用）
     bool                      m_diagPrinted = false; // 缓冲容量诊断是否已打印（只打一次）
     int                       m_errLogCount = 0;     // 连续失败日志计数（限流用）
+    bool                      m_useYuyv = false;     // 当前采集格式：true=YUYV(未压缩)，false=MJPG
+    // 说明：VMware 虚拟 USB 摄像头输出的 MJPG 流本身频繁损坏（Corrupt JPEG data），
+    //       这是 VMware/驱动层问题，应用层重开设备也拿不到干净流。YUYV 是未压缩
+    //       像素流，无 JPEG 解压环节 → 从源头消除"解码出半张坏图"类故障。
+    //       优先尝试 YUYV，失败自动回退 MJPG（保证兼容性）。
 
     // 初始化：open + 配置 MJPG 640x480 + 申请 mmap 缓冲 + 启动流
     bool init(int deviceIndex, int width, int height, int fps) {
@@ -57,17 +62,32 @@ struct Camera::Impl {
             return false;
         }
 
-        // 2. 设置采集格式为 MJPG（强制优先，VMware 直通场景下最稳）
+        // 2. 设置采集格式：优先 YUYV（未压缩），失败回退 MJPG。
+        //    背景：VMware 虚拟 USB 摄像头输出的 MJPG 流本身频繁损坏
+        //    （libjpeg 报 "Corrupt JPEG data"），重开设备也无法修复——
+        //    这是 VMware/驱动层问题。YUYV 是未压缩像素流，无 JPEG 解压
+        //    环节，从源头消除"解码出半张坏图"类故障。
+        //    注意：YUYV 数据量大（640x480x2≈614KB/帧），VMware USB 重定向
+        //    带宽是否够用需实测；若 YUYV 打不开则自动回退 MJPG。
         v4l2_format fmt{};
         fmt.type                = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         fmt.fmt.pix.width       = static_cast<__u32>(width);
         fmt.fmt.pix.height      = static_cast<__u32>(height);
-        fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_MJPEG;
+        fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
         fmt.fmt.pix.field       = V4L2_FIELD_NONE;
-        if (::ioctl(fd, VIDIOC_S_FMT, &fmt) < 0) {
-            std::fprintf(stderr, "[Camera] 设置 MJPG 格式失败：%s\n", std::strerror(errno));
-            cleanup();
-            return false;
+        if (::ioctl(fd, VIDIOC_S_FMT, &fmt) == 0 && fmt.fmt.pix.pixelformat == V4L2_PIX_FMT_YUYV) {
+            m_useYuyv = true;
+            std::printf("[Camera] 已启用 YUYV 未压缩格式（无 MJPG 损坏问题）\n");
+        } else {
+            // 回退 MJPG（兼容不支持 YUYV 的摄像头）
+            m_useYuyv = false;
+            fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_MJPEG;
+            if (::ioctl(fd, VIDIOC_S_FMT, &fmt) < 0) {
+                std::fprintf(stderr, "[Camera] 设置 MJPG 格式失败：%s\n", std::strerror(errno));
+                cleanup();
+                return false;
+            }
+            std::printf("[Camera] 摄像头不支持 YUYV，回退 MJPG\n");
         }
         // 回读实际生效参数（部分摄像头会忽略请求值）
         m_width  = static_cast<int>(fmt.fmt.pix.width);
@@ -193,20 +213,45 @@ struct Camera::Impl {
             return false;
         }
 
-        // 4. 提取 MJPG 有效区间并解码
-        //    背景：VMware USB 直通下 UVC 传输不稳定，帧可能包含损坏/多余字节。
-        //    策略：定位最后一个 SOI(0xFFD8) 到 EOI(0xFFD9)，截取有效区间后解码；
-        //          若找不到 EOI，则以 SOI 至缓冲末尾为区间（libjpeg 容忍 EOI 缺失）。
-        const unsigned char* data   = static_cast<const unsigned char*>(bufStarts[buf.index]);
-        const __u32         used    = buf.bytesused;
-        // 保存 bytesused 副本：QBUF 归还后驱动可能清零 buf.bytesused，导致日志误导
-        // 诊断辅助：打印首次帧的缓冲实际容量（若远小于正常 MJPG 帧大小，说明缓冲过小需扩容）
+        const unsigned char* data = static_cast<const unsigned char*>(bufStarts[buf.index]);
+        const __u32         used  = buf.bytesused;
+        // 诊断辅助：打印首次帧的缓冲实际容量
         if (!m_diagPrinted) {
-            std::printf("[Camera] 诊断：缓冲容量=%zu 字节，首帧字节数=%u\n",
-                        bufLengths[buf.index], used);
+            std::printf("[Camera] 诊断：缓冲容量=%zu 字节，首帧字节数=%u，格式=%s\n",
+                        bufLengths[buf.index], used, m_useYuyv ? "YUYV" : "MJPG");
             m_diagPrinted = true;
         }
 
+        // ---- 4A. YUYV 未压缩格式：直接 YUYV→BGR 转换，无 JPEG 解压环节 ----
+        if (m_useYuyv) {
+            // 期望字节数 = 宽×高×2（YUYV 每像素 2 字节）
+            const size_t expectBytes = static_cast<size_t>(m_width) * m_height * 2u;
+            if (used >= expectBytes) {
+                cv::Mat yuyv(m_height, m_width, CV_8UC2, const_cast<unsigned char*>(data));
+                cv::Mat bgr;
+                // YUYV 打包格式：Y0 U0 Y1 V0 Y2 U1 Y3 V1 ...
+                cv::cvtColor(yuyv, bgr, cv::COLOR_YUV2BGR_YUYV);
+                // 立即归还缓冲，保证轮转速度
+                ::ioctl(fd, VIDIOC_QBUF, &buf);
+                if (!bgr.empty()) {
+                    bgr.copyTo(frame);
+                    return true;
+                }
+            }
+            // 数据不足：归还缓冲，返回失败由上层重试
+            ::ioctl(fd, VIDIOC_QBUF, &buf);
+            if (m_errLogCount < 5) {
+                std::fprintf(stderr, "[Camera] 读帧失败：YUYV 数据不完整（%u/%zu 字节）。\n",
+                             used, expectBytes);
+                ++m_errLogCount;
+            }
+            return false;
+        }
+
+        // ---- 4B. MJPG 压缩格式：提取有效区间并 imdecode 解码 ----
+        //    背景：VMware USB 直通下 UVC 传输不稳定，帧可能包含损坏/多余字节。
+        //    策略：定位最后一个 SOI(0xFFD8) 到 EOI(0xFFD9)，截取有效区间后解码；
+        //          若找不到 EOI，则以 SOI 至缓冲末尾为区间（libjpeg 容忍 EOI 缺失）。
         // 4a. 从尾部向前找最后一个 EOI（0xFFD9），取其后位置作为区间结尾
         int endPos = static_cast<int>(used);
         for (int i = static_cast<int>(used) - 1; i >= 1; --i) {
